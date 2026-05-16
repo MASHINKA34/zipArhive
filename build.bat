@@ -1,14 +1,15 @@
 @echo off
-rem Сборка Quick Zip в один исполняемый файл через PyInstaller.
 setlocal
 
 set NAME=QuickZip
 set ICON_OPT=
-if exist "assets\icons\app.ico" set ICON_OPT=--icon=assets\icons\app.ico
+set DATA_OPT=
+if exist "assets\icons\app.ico" set ICON_OPT=--icon "assets\icons\app.ico"
+if exist "assets\icons\app.ico" set DATA_OPT=--add-data "assets\icons\app.ico;assets\icons"
 
 echo Сборка %NAME%.exe ...
 
-pyinstaller --noconfirm --clean --onefile --windowed --name %NAME% %ICON_OPT% main.py
+pyinstaller --noconfirm --clean --onefile --windowed --name %NAME% %ICON_OPT% %DATA_OPT% main.py
 
 if errorlevel 1 (
     echo.

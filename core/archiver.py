@@ -110,7 +110,9 @@ def create_zip(
     used: set[str] = set()
 
     try:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(
+            zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True
+        ) as zf:
             for item in items:
                 if should_cancel and should_cancel():
                     raise InterruptedError

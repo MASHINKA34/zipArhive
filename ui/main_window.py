@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import base64
 import os
 import sys
+import tempfile
 
 from PyQt6.QtCore import (
     QByteArray,
     QPointF,
     QRectF,
+    QSize,
     Qt,
     QThread,
+    QTimer,
     pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -18,23 +22,24 @@ from PyQt6.QtGui import (
     QIcon,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QPolygonF,
+    QTransform,
 )
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
-    QCheckBox,
-    QDialog,
     QFileDialog,
+    QFileIconProvider,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -45,12 +50,10 @@ from PyQt6.QtWidgets import (
 from core.archiver import (
     ArchiveItem,
     create_zip,
-    expand_folder,
     human_size,
-    make_item,
-    make_items,
     plural_files,
 )
+from ui.appicon_data import APPICON_PNG_B64
 
 C_CANVAS = "#0f0f0f"
 C_WINDOW = "#1a1a1a"
@@ -91,6 +94,7 @@ _TYPE_MAP = {
     "py": ("#3B6EA5", "PY"), "js": ("#C9A227", "JS"),
     "ts": ("#2B7FBF", "TS"), "html": ("#C1502E", "HTML"),
     "css": ("#2B6FB8", "CSS"), "sh": ("#4F7A4F", "SH"),
+    "sql": ("#8A6D3B", "SQL"),
     "zip": ("#C9952B", "ZIP"), "rar": ("#C9952B", "RAR"),
     "7z": ("#C9952B", "7Z"), "gz": ("#C9952B", "GZ"),
     "tar": ("#C9952B", "TAR"),
@@ -99,11 +103,10 @@ _TYPE_MAP = {
 }
 
 _SVG = {
-    "add_file": (
+    "add_folder": (
         '<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
-        '<path d="M9 1.5H4.5A1.5 1.5 0 0 0 3 3v10a1.5 1.5 0 0 0 1.5 1.5h7A1.5 1.5 0 0 0 13 13V5.5L9 1.5Z" stroke="{c}" stroke-width="1.1" stroke-linejoin="round"/>'
-        '<path d="M9 1.5V5.5H13" stroke="{c}" stroke-width="1.1" stroke-linejoin="round"/>'
-        '<path d="M8 8V12M6 10H10" stroke="{c}" stroke-width="1.1" stroke-linecap="round"/></svg>'
+        '<path d="M1.75 4.25C1.75 3.56 2.31 3 3 3h3.17c.33 0 .64.13.87.36l.85.85c.23.23.55.36.88.36H13c.69 0 1.25.56 1.25 1.25v6.43c0 .69-.56 1.25-1.25 1.25H3c-.69 0-1.25-.56-1.25-1.25V4.25Z" stroke="{c}" stroke-width="1.1" stroke-linejoin="round"/>'
+        '<path d="M8 8V11.5M6.25 9.75H9.75" stroke="{c}" stroke-width="1.1" stroke-linecap="round"/></svg>'
     ),
     "clear": (
         '<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
@@ -119,11 +122,20 @@ _SVG = {
         '<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
         '<path d="M6 4L10 8L6 12" stroke="{c}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
     ),
-    "folder": (
-        '<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
-        '<path d="M1.5 4.2C1.5 3.5 2 3 2.7 3h3.1c.3 0 .6.13.83.35l.9.9c.22.22.52.35.83.35H13.3c.66 0 1.2.54 1.2 1.2v6.6c0 .66-.54 1.2-1.2 1.2H2.7c-.66 0-1.2-.54-1.2-1.2V4.2Z" fill="{c}"/></svg>'
-    ),
 }
+
+_tile_cache: dict[str, QIcon] = {}
+_folder_icon_cache: list[QIcon] = []
+_icon_provider: list[QFileIconProvider] = []
+_arrow_cache: list[tuple[str, str]] = []
+
+
+def asset_path(*parts: str) -> str:
+    if hasattr(sys, "_MEIPASS"):
+        root = sys._MEIPASS
+    else:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, *parts)
 
 
 def _dpr() -> float:
@@ -149,8 +161,7 @@ def kind_of(path: str) -> str:
     return os.path.splitext(path)[1].lstrip(".").lower()
 
 
-def file_tile(path: str, size: int = 28) -> QPixmap:
-    ext = kind_of(path)
+def file_tile(ext: str, size: int = 22) -> QPixmap:
     info = _TYPE_MAP.get(ext)
     if info:
         color, label = info
@@ -170,10 +181,10 @@ def file_tile(path: str, size: int = 28) -> QPixmap:
     base = QColor(color)
     rect = QRectF(0.5, 0.5, size - 1, size - 1)
     body = QPainterPath()
-    body.addRoundedRect(rect, 6, 6)
+    body.addRoundedRect(rect, 5, 5)
     p.fillPath(body, base)
 
-    fold = 9
+    fold = 7
     tri = QPolygonF([
         QPointF(size - fold, 0.5),
         QPointF(size - 0.5, 0.5),
@@ -189,48 +200,84 @@ def file_tile(path: str, size: int = 28) -> QPixmap:
     if label:
         f = QFont("Segoe UI")
         f.setBold(True)
-        f.setPixelSize(9 if len(label) <= 3 else 7)
+        f.setPixelSize(8 if len(label) <= 3 else 6)
         p.setFont(f)
         p.setPen(QColor("white"))
-        p.drawText(QRectF(0, 2, size, size - 2),
+        p.drawText(QRectF(0, 1, size, size - 1),
                    Qt.AlignmentFlag.AlignCenter, label)
     else:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(255, 255, 255, 215))
-        line_w = 14.0
+        line_w = size * 0.5
         x = (size - line_w) / 2
-        for i, y in enumerate((10.0, 14.0, 18.0)):
+        for i, y in enumerate((size * 0.34, size * 0.5, size * 0.66)):
             w = line_w if i < 2 else line_w * 0.6
-            p.drawRoundedRect(QRectF(x, y, w, 2.2), 1, 1)
+            p.drawRoundedRect(QRectF(x, y, w, 1.8), 1, 1)
 
     p.end()
     pm.setDevicePixelRatio(ratio)
     return pm
 
 
-def folder_pixmap(size: int = 28) -> QPixmap:
-    return svg_icon("folder", size, "#D8A23A")
+def tile_icon(path: str) -> QIcon:
+    ext = kind_of(path)
+    key = ext or "_"
+    icon = _tile_cache.get(key)
+    if icon is None:
+        icon = QIcon(file_tile(ext))
+        _tile_cache[key] = icon
+    return icon
+
+
+def folder_icon() -> QIcon:
+    if not _folder_icon_cache:
+        if not _icon_provider:
+            _icon_provider.append(QFileIconProvider())
+        _folder_icon_cache.append(
+            _icon_provider[0].icon(QFileIconProvider.IconType.Folder)
+        )
+    return _folder_icon_cache[0]
 
 
 def app_icon() -> QIcon:
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ico = os.path.join(here, "assets", "icons", "app.ico")
+    ico = asset_path("assets", "icons", "app.ico")
     if os.path.exists(ico):
-        return QIcon(ico)
-    pm = QPixmap(64, 64)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(C_ACCENT))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.drawRoundedRect(2, 2, 60, 60, 14, 14)
-    f = QFont("Segoe UI", 34)
-    f.setBold(True)
-    p.setFont(f)
-    p.setPen(QColor("white"))
-    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "Z")
-    p.end()
-    return QIcon(pm)
+        disk = QIcon(ico)
+        if not disk.isNull() and disk.availableSizes():
+            return disk
+    pm = QPixmap()
+    pm.loadFromData(base64.b64decode(APPICON_PNG_B64), "PNG")
+    icon = QIcon()
+    for s in (16, 20, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(
+            pm.scaled(
+                s, s,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+    return icon
+
+
+def branch_arrows() -> tuple[str, str]:
+    if _arrow_cache:
+        return _arrow_cache[0]
+    folder = os.path.join(tempfile.gettempdir(), "quickzip_ui")
+    os.makedirs(folder, exist_ok=True)
+    closed_path = os.path.join(folder, "arrow_closed.png")
+    open_path = os.path.join(folder, "arrow_open.png")
+    right = svg_icon("chevron", 13, "#c8c8c8")
+    right.save(closed_path, "PNG")
+    down = right.transformed(
+        QTransform().rotate(90), Qt.TransformationMode.SmoothTransformation
+    )
+    down.save(open_path, "PNG")
+    result = (
+        closed_path.replace(os.sep, "/"),
+        open_path.replace(os.sep, "/"),
+    )
+    _arrow_cache.append(result)
+    return result
 
 
 class TriCheckBox(QWidget):
@@ -342,12 +389,11 @@ class TitleBar(QWidget):
         lay.setContentsMargins(12, 0, 0, 0)
         lay.setSpacing(8)
 
-        glyph = QLabel("Z")
-        glyph.setFixedSize(16, 16)
+        glyph = QLabel()
+        glyph.setFixedSize(18, 18)
         glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        glyph.setStyleSheet(
-            f"background: {C_ACCENT}; border-radius: 3px; color: white; "
-            f"font-size: 9px; font-weight: 700;"
+        glyph.setPixmap(
+            app_icon().pixmap(QSize(18, 18))
         )
         lay.addWidget(glyph)
 
@@ -373,111 +419,6 @@ class TitleBar(QWidget):
 
     def mouseDoubleClickEvent(self, _event):
         self._win.toggle_max_restore()
-
-
-class FileRow(QWidget):
-    def __init__(self, record: dict, index: int, on_toggle):
-        super().__init__()
-        self.record = record
-        self._on_toggle = on_toggle
-        self.setFixedHeight(44)
-        bg = C_PANEL if index % 2 == 0 else C_PANEL_ALT
-        self.setStyleSheet(
-            f"FileRow {{ background: {bg}; "
-            f"border-bottom: 1px solid {C_BORDER}; }}"
-        )
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        cb_wrap = QWidget()
-        cb_wrap.setFixedWidth(44)
-        cb_lay = QHBoxLayout(cb_wrap)
-        cb_lay.setContentsMargins(0, 0, 0, 0)
-        cb_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.checkbox = TriCheckBox()
-        self.checkbox.set_state(record["checked"])
-        self.checkbox.toggled.connect(self._toggled)
-        cb_lay.addWidget(self.checkbox)
-        lay.addWidget(cb_wrap)
-
-        icon_wrap = QWidget()
-        icon_wrap.setFixedWidth(40)
-        icon_lay = QHBoxLayout(icon_wrap)
-        icon_lay.setContentsMargins(0, 0, 0, 0)
-        icon_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon = QLabel()
-        icon.setPixmap(file_tile(record["path"]))
-        icon_lay.addWidget(icon)
-        lay.addWidget(icon_wrap)
-
-        name = QLabel(record["name"])
-        name.setStyleSheet(
-            f"color: {C_TEXT}; font-size: 13px; padding-right: 12px;"
-        )
-        name.setToolTip(record["name"])
-        lay.addWidget(name, 1)
-
-        size = QLabel(human_size(record["size"]))
-        size.setFixedWidth(90)
-        size.setStyleSheet(f"color: {C_TEXT_SOFT}; font-size: 13px;")
-        lay.addWidget(size)
-
-        path = QLabel()
-        path.setFixedWidth(220)
-        path.setStyleSheet(
-            f"color: {C_TEXT_DIM}; font-size: 12px; "
-            f"font-family: 'Consolas','Courier New'; padding-right: 16px;"
-        )
-        path.setToolTip(record["path"])
-        metrics = path.fontMetrics()
-        path.setText(
-            metrics.elidedText(record["dir"], Qt.TextElideMode.ElideMiddle, 196)
-        )
-        lay.addWidget(path)
-
-    def _toggled(self, value: bool):
-        self.record["checked"] = value
-        self._on_toggle()
-
-
-class ListHeader(QWidget):
-    def __init__(self, on_select_all):
-        super().__init__()
-        self.setFixedHeight(37)
-        self.setStyleSheet(
-            f"ListHeader {{ background: {C_BAR}; "
-            f"border-bottom: 1px solid {C_BORDER}; }}"
-        )
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        cb_wrap = QWidget()
-        cb_wrap.setFixedWidth(44)
-        cb_lay = QHBoxLayout(cb_wrap)
-        cb_lay.setContentsMargins(0, 0, 0, 0)
-        cb_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.checkbox = TriCheckBox()
-        self.checkbox.toggled.connect(on_select_all)
-        cb_lay.addWidget(self.checkbox)
-        lay.addWidget(cb_wrap)
-
-        lay.addSpacing(40)
-
-        style = f"color: {C_TEXT_DIM}; font-size: 12px; font-weight: 600;"
-        name = QLabel("Имя")
-        name.setStyleSheet(style)
-        lay.addWidget(name, 1)
-        size = QLabel("Размер")
-        size.setFixedWidth(90)
-        size.setStyleSheet(style)
-        lay.addWidget(size)
-        path = QLabel("Путь")
-        path.setFixedWidth(220)
-        path.setStyleSheet(style + " padding-right: 16px;")
-        lay.addWidget(path)
 
 
 class EmptyState(QWidget):
@@ -508,7 +449,7 @@ class EmptyState(QWidget):
         badge.setPixmap(svg_icon("box", 44, C_ACCENT_HI))
         zlay.addWidget(badge, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        title = QLabel("Перетащите файлы сюда")
+        title = QLabel("Перетащите папку сюда")
         title.setStyleSheet(
             f"color: {C_TEXT}; font-size: 16px; font-weight: 600;"
         )
@@ -517,17 +458,16 @@ class EmptyState(QWidget):
 
         sub = QLabel(
             'или нажмите <span style="color:#3A9BE5;font-weight:600;">'
-            "Добавить файлы</span>, чтобы начать"
+            "Добавить папку</span>, чтобы начать"
         )
         sub.setTextFormat(Qt.TextFormat.RichText)
         sub.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 13px;")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         zlay.addWidget(sub)
 
-        hint = QLabel("Поддерживаются  любые типы файлов  ·  до 4 ГБ")
+        hint = QLabel("Папки можно раскрывать и отмечать файлы галочками")
         hint.setStyleSheet(
             f"color: {C_TEXT_FAINT}; font-size: 11px; "
-            f"font-family: 'Consolas','Courier New'; "
             f"border-top: 1px solid {C_PANEL_ALT}; padding-top: 10px;"
         )
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -588,7 +528,7 @@ class BottomPanel(QWidget):
                 f'<span style="color:{C_TEXT_DIM};">Выбрано: </span><b>0</b>'
                 f'<span style="color:{C_TEXT_DIM};"> файлов</span>'
             )
-            self.estimate.setText("Добавьте файлы, чтобы начать")
+            self.estimate.setText("Добавьте папку, чтобы начать")
         self._restyle(enabled)
 
     def _restyle(self, enabled: bool):
@@ -676,307 +616,9 @@ class PackWorker(QThread):
 
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
-ROLE_ISDIR = Qt.ItemDataRole.UserRole + 1
-ROLE_LOADED = Qt.ItemDataRole.UserRole + 2
-
-
-class FolderSelectDialog(QDialog):
-    def __init__(self, root: str, parent=None):
-        super().__init__(parent)
-        self._root = os.path.normpath(root)
-        self._mute = False
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
-        self.setModal(True)
-        self.resize(760, 580)
-        self.setMinimumSize(560, 440)
-        self.setObjectName("dlg")
-        self.setStyleSheet(
-            f"""
-            #dlg {{ background: {C_WINDOW}; border: 1px solid {C_BORDER}; }}
-            QLabel {{ color: {C_TEXT}; }}
-            QTreeWidget {{
-                background: {C_WINDOW}; border: 1px solid {C_BORDER};
-                color: {C_TEXT}; font-size: 13px; outline: none;
-            }}
-            QTreeWidget::item {{ height: 26px; }}
-            QTreeWidget::item:selected {{ background: #2d3a47; }}
-            QHeaderView::section {{
-                background: {C_BAR}; color: {C_TEXT_DIM};
-                border: none; border-bottom: 1px solid {C_BORDER};
-                padding: 6px 8px; font-size: 12px; font-weight: 600;
-            }}
-            QScrollBar:vertical {{
-                background: {C_WINDOW}; width: 10px; margin: 0;
-            }}
-            QScrollBar::handle:vertical {{
-                background: #3a3a3a; border-radius: 5px; min-height: 30px;
-            }}
-            QScrollBar::handle:vertical:hover {{ background: #4a4a4a; }}
-            QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-            QCheckBox {{ color: {C_TEXT_SOFT}; font-size: 12px; }}
-            """
-        )
-
-        root_lay = QVBoxLayout(self)
-        root_lay.setContentsMargins(0, 0, 0, 0)
-        root_lay.setSpacing(0)
-
-        bar = QWidget()
-        bar.setFixedHeight(36)
-        bar.setObjectName("dbar")
-        bar.setStyleSheet(
-            f"#dbar {{ background: {C_BAR}; "
-            f"border-bottom: 1px solid {C_BORDER}; }}"
-        )
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(14, 0, 6, 0)
-        cap = QLabel("Выбор файлов и папок")
-        cap.setStyleSheet(f"color: {C_TEXT}; font-size: 12px;")
-        bl.addWidget(cap)
-        bl.addStretch(1)
-        close = CaptionButton("✕", close=True)
-        close.clicked.connect(self.reject)
-        bl.addWidget(close)
-        self._bar = bar
-        bar.mousePressEvent = self._bar_press
-        root_lay.addWidget(bar)
-
-        path_lbl = QLabel(self._root)
-        path_lbl.setStyleSheet(
-            f"color: {C_TEXT_DIM}; font-size: 12px; "
-            f"font-family: 'Consolas','Courier New'; "
-            f"background: {C_PANEL}; padding: 8px 14px; "
-            f"border-bottom: 1px solid {C_BORDER};"
-        )
-        root_lay.addWidget(path_lbl)
-
-        body = QWidget()
-        body.setStyleSheet(f"background: {C_WINDOW};")
-        body_lay = QVBoxLayout(body)
-        body_lay.setContentsMargins(14, 12, 14, 12)
-        body_lay.setSpacing(10)
-
-        self._all_cb = QCheckBox("Выбрать всё")
-        self._all_cb.setChecked(True)
-        self._all_cb.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._all_cb.toggled.connect(self._toggle_all)
-        body_lay.addWidget(self._all_cb)
-
-        self.tree = QTreeWidget()
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Имя", "Размер"])
-        self.tree.setRootIsDecorated(True)
-        self.tree.setUniformRowHeights(True)
-        hdr = self.tree.header()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.tree.setColumnWidth(1, 110)
-        self.tree.itemExpanded.connect(self._on_expand)
-        self.tree.itemChanged.connect(self._on_item_changed)
-        body_lay.addWidget(self.tree, 1)
-
-        root_lay.addWidget(body, 1)
-
-        foot = QWidget()
-        foot.setStyleSheet(
-            f"background: {C_PANEL}; border-top: 1px solid {C_BORDER};"
-        )
-        fl = QHBoxLayout(foot)
-        fl.setContentsMargins(14, 12, 14, 12)
-        self._hint = QLabel("")
-        self._hint.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 12px;")
-        fl.addWidget(self._hint)
-        fl.addStretch(1)
-
-        cancel = QPushButton("Отмена")
-        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel.setStyleSheet(
-            f"""
-            QPushButton {{
-                background: {C_PANEL_ALT}; border: 1px solid {C_BORDER};
-                border-radius: 4px; padding: 9px 18px; color: {C_TEXT};
-                font-size: 13px;
-            }}
-            QPushButton:hover {{ background: #323232; }}
-            """
-        )
-        cancel.clicked.connect(self.reject)
-        fl.addWidget(cancel)
-
-        add = QPushButton("Добавить в список")
-        add.setCursor(Qt.CursorShape.PointingHandCursor)
-        add.setStyleSheet(
-            f"""
-            QPushButton {{
-                background: {C_ACCENT}; border: 1px solid {C_ACCENT_BR};
-                border-radius: 4px; padding: 9px 18px; color: white;
-                font-size: 13px; font-weight: 600;
-            }}
-            QPushButton:hover {{ background: #1A8AE0; }}
-            """
-        )
-        add.clicked.connect(self.accept)
-        fl.addWidget(add)
-        root_lay.addWidget(foot)
-
-        self._folder_icon = QIcon(folder_pixmap(22))
-        self._populate(self.tree.invisibleRootItem(), self._root, True)
-
-    def _bar_press(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            handle = self.windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
-
-    def _make_item(self, parent, path: str, is_dir: bool, checked: bool):
-        it = QTreeWidgetItem(parent)
-        it.setText(0, os.path.basename(path) or path)
-        it.setData(0, ROLE_PATH, path)
-        it.setData(0, ROLE_ISDIR, is_dir)
-        it.setData(0, ROLE_LOADED, False)
-        it.setFlags(
-            Qt.ItemFlag.ItemIsEnabled
-            | Qt.ItemFlag.ItemIsSelectable
-            | Qt.ItemFlag.ItemIsUserCheckable
-        )
-        it.setCheckState(
-            0,
-            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
-        )
-        if is_dir:
-            it.setIcon(0, self._folder_icon)
-            placeholder = QTreeWidgetItem(it)
-            placeholder.setData(0, ROLE_PATH, "")
-            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
-        else:
-            it.setIcon(0, QIcon(file_tile(path, 22)))
-            try:
-                it.setText(1, human_size(os.path.getsize(path)))
-            except OSError:
-                it.setText(1, "")
-            it.setTextAlignment(
-                1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-        return it
-
-    def _populate(self, parent_item, folder: str, checked: bool):
-        try:
-            entries = list(os.scandir(folder))
-        except OSError:
-            return
-        dirs, files = [], []
-        for e in entries:
-            try:
-                if e.is_dir():
-                    dirs.append(e.path)
-                else:
-                    files.append(e.path)
-            except OSError:
-                pass
-        dirs.sort(key=lambda s: os.path.basename(s).lower())
-        files.sort(key=lambda s: os.path.basename(s).lower())
-        self._mute = True
-        for d in dirs:
-            self._make_item(parent_item, d, True, checked)
-        for f in files:
-            self._make_item(parent_item, f, False, checked)
-        self._mute = False
-
-    def _on_expand(self, item: QTreeWidgetItem):
-        if item.data(0, ROLE_LOADED):
-            return
-        item.setData(0, ROLE_LOADED, True)
-        self._mute = True
-        for i in reversed(range(item.childCount())):
-            item.removeChild(item.child(i))
-        self._mute = False
-        checked = item.checkState(0) == Qt.CheckState.Checked
-        self._populate(item, item.data(0, ROLE_PATH), checked)
-
-    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
-        if column != 0 or self._mute:
-            return
-        state = item.checkState(0)
-        self._mute = True
-        if state in (Qt.CheckState.Checked, Qt.CheckState.Unchecked):
-            self._apply_down(item, state)
-        self._update_ancestors(item.parent())
-        self._mute = False
-
-    def _apply_down(self, item: QTreeWidgetItem, state):
-        for i in range(item.childCount()):
-            child = item.child(i)
-            if child.flags() == Qt.ItemFlag.NoItemFlags:
-                continue
-            child.setCheckState(0, state)
-            self._apply_down(child, state)
-
-    def _update_ancestors(self, item):
-        while item is not None:
-            states = []
-            for i in range(item.childCount()):
-                child = item.child(i)
-                if child.flags() == Qt.ItemFlag.NoItemFlags:
-                    continue
-                states.append(child.checkState(0))
-            if states and all(s == Qt.CheckState.Checked for s in states):
-                item.setCheckState(0, Qt.CheckState.Checked)
-            elif states and all(
-                s == Qt.CheckState.Unchecked for s in states
-            ):
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-            else:
-                item.setCheckState(0, Qt.CheckState.PartiallyChecked)
-            item = item.parent()
-
-    def _toggle_all(self, checked: bool):
-        state = (
-            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-        )
-        root = self.tree.invisibleRootItem()
-        self._mute = True
-        for i in range(root.childCount()):
-            top = root.child(i)
-            top.setCheckState(0, state)
-            self._apply_down(top, state)
-        self._mute = False
-
-    def _collect(self, item, out: list[str]):
-        is_dir = item.data(0, ROLE_ISDIR)
-        path = item.data(0, ROLE_PATH)
-        state = item.checkState(0)
-        if not is_dir:
-            if state == Qt.CheckState.Checked and path:
-                out.append(path)
-            return
-        if state == Qt.CheckState.Unchecked:
-            return
-        loaded = item.data(0, ROLE_LOADED)
-        if state == Qt.CheckState.Checked and not loaded:
-            for r, _d, fs in os.walk(path):
-                for f in fs:
-                    out.append(os.path.join(r, f))
-            return
-        for i in range(item.childCount()):
-            child = item.child(i)
-            if child.flags() == Qt.ItemFlag.NoItemFlags:
-                continue
-            self._collect(child, out)
-
-    def selected_files(self) -> list[str]:
-        out: list[str] = []
-        root = self.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            self._collect(root.child(i), out)
-        seen = set()
-        unique = []
-        for p in out:
-            np = os.path.normpath(p)
-            if np not in seen and os.path.isfile(np):
-                seen.add(np)
-                unique.append(np)
-        return unique
-
+ROLE_SIZE = Qt.ItemDataRole.UserRole + 1
+ROLE_ARC = Qt.ItemDataRole.UserRole + 2
+ROLE_ISFILE = Qt.ItemDataRole.UserRole + 3
 
 RESIZE_MARGIN = 5
 
@@ -993,9 +635,11 @@ class MainWindow(QWidget):
         self.setObjectName("root")
         self.setStyleSheet(f"#root {{ background: {C_WINDOW}; }}")
 
-        self._records: list[dict] = []
-        self._rows: list[FileRow] = []
+        self._file_items: list[QTreeWidgetItem] = []
+        self._roots: set[str] = set()
         self._worker: PackWorker | None = None
+        self._building = False
+        self._summary_pending = False
         self._suggested_name = ""
         self._suggested_dir = ""
         self._last_target = "архив.zip"
@@ -1010,37 +654,11 @@ class MainWindow(QWidget):
         root.addWidget(self.title_bar)
         root.addWidget(self._build_toolbar())
 
-        self.header = ListHeader(self._on_select_all)
-        root.addWidget(self.header)
-
         self.stack = QStackedWidget()
         self.empty = EmptyState()
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setStyleSheet(
-            f"""
-            QScrollArea {{ background: {C_WINDOW}; border: none; }}
-            QScrollBar:vertical {{
-                background: {C_WINDOW}; width: 10px; margin: 0;
-            }}
-            QScrollBar::handle:vertical {{
-                background: #3a3a3a; border-radius: 5px; min-height: 30px;
-            }}
-            QScrollBar::handle:vertical:hover {{ background: #4a4a4a; }}
-            QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-            """
-        )
-        self.list_host = QWidget()
-        self.list_host.setStyleSheet(f"background: {C_WINDOW};")
-        self.list_lay = QVBoxLayout(self.list_host)
-        self.list_lay.setContentsMargins(0, 0, 0, 0)
-        self.list_lay.setSpacing(0)
-        self.list_lay.addStretch(1)
-        self.scroll.setWidget(self.list_host)
-
+        self.tree = self._build_tree()
         self.stack.addWidget(self.empty)
-        self.stack.addWidget(self.scroll)
+        self.stack.addWidget(self.tree)
         root.addWidget(self.stack, 1)
 
         self.bottom = BottomPanel()
@@ -1050,7 +668,7 @@ class MainWindow(QWidget):
         self.status = StatusBar()
         root.addWidget(self.status)
 
-        self._refresh()
+        self._refresh_view()
 
     def _build_toolbar(self) -> QWidget:
         bar = QWidget()
@@ -1063,8 +681,8 @@ class MainWindow(QWidget):
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(8)
 
-        b_add = ToolbarButton("add_file", "Добавить файлы")
-        b_add.clicked.connect(self._add_via_dialog)
+        b_add = ToolbarButton("add_folder", "Добавить папку")
+        b_add.clicked.connect(self._add_folder)
         sep = QFrame()
         sep.setFixedSize(1, 22)
         sep.setStyleSheet(f"background: {C_BORDER};")
@@ -1079,118 +697,307 @@ class MainWindow(QWidget):
         lay.addStretch(1)
         return bar
 
-    def _add_records(self, items: list[ArchiveItem]):
-        existing = {r["path"] for r in self._records}
-        added = 0
-        for it in items:
-            if it.src in existing:
-                continue
-            existing.add(it.src)
-            self._records.append({
-                "path": it.src,
-                "arcname": it.arcname,
-                "name": os.path.basename(it.src),
-                "dir": os.path.dirname(it.src),
-                "size": it.size,
-                "checked": True,
-            })
-            added += 1
-        self._refresh()
-        return added
-
-    def _add_via_dialog(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Выберите папку с файлами"
+    def _build_tree(self) -> QTreeWidget:
+        tree = QTreeWidget()
+        tree.setColumnCount(3)
+        tree.setHeaderHidden(False)
+        tree.setHeaderLabels(["Имя", "Размер", "Путь"])
+        tree.setUniformRowHeights(True)
+        tree.setAlternatingRowColors(True)
+        tree.setIndentation(16)
+        tree.setIconSize(QSize(22, 22))
+        tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
         )
-        if not folder:
-            return
+        tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tree.headerItem().setTextAlignment(
+            1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        hdr = tree.header()
+        hdr.setFixedHeight(38)
+        hdr.setStretchLastSection(False)
+        hdr.setSortIndicatorShown(False)
+        hdr.setSectionsClickable(False)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        tree.setColumnWidth(1, 110)
+        tree.setColumnWidth(2, 300)
+
+        tree.itemChanged.connect(self._on_item_changed)
+        arrow_closed, arrow_open = branch_arrows()
+        tree.setStyleSheet(
+            f"""
+            QTreeWidget {{
+                background: {C_PANEL};
+                alternate-background-color: {C_PANEL_ALT};
+                color: {C_TEXT}; font-size: 13px;
+                border: none; outline: none;
+            }}
+            QHeaderView {{ background: {C_BAR}; }}
+            QHeaderView::section {{
+                background: {C_BAR}; color: {C_TEXT_DIM};
+                font-size: 12px; font-weight: 600;
+                border: 0px; border-bottom: 1px solid {C_BORDER};
+                padding: 0 10px;
+            }}
+            QHeaderView::section:first {{ padding-left: 46px; }}
+            QTreeView::item {{ height: 30px; border: none; }}
+            QTreeView::item:hover {{ background: #2c2f33; }}
+            QTreeView::item:selected {{
+                background: transparent; color: {C_TEXT};
+            }}
+            QTreeView::branch {{ background: transparent; }}
+            QTreeView::branch:selected, QTreeView::branch:hover {{
+                background: transparent;
+            }}
+            QTreeView::branch:has-children:closed {{
+                image: url("{arrow_closed}");
+            }}
+            QTreeView::branch:has-children:open {{
+                image: url("{arrow_open}");
+            }}
+            QScrollBar:vertical {{
+                background: {C_WINDOW}; width: 10px; margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #3a3a3a; border-radius: 5px; min-height: 30px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: #4a4a4a; }}
+            QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+            QScrollBar:horizontal {{
+                background: {C_WINDOW}; height: 10px; margin: 0;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: #3a3a3a; border-radius: 5px; min-width: 30px;
+            }}
+            """
+        )
+
+        self._sel_all = TriCheckBox(hdr)
+        self._sel_all.setGeometry(15, 9, 20, 20)
+        self._sel_all.toggled.connect(self._on_select_all)
+        self._sel_all.raise_()
+        return tree
+
+    def _add_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку"
+        )
+        if folder:
+            self.add_folder_path(folder)
+
+    def add_folder_path(self, folder: str):
         folder = os.path.normpath(folder)
-        dlg = FolderSelectDialog(folder, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        if not os.path.isdir(folder):
             return
-        files = dlg.selected_files()
-        if not files:
-            self.status.set_text("Ничего не выбрано", self._last_target)
-            return
+        if folder in self._roots:
+            for i in range(self.tree.topLevelItemCount()):
+                top = self.tree.topLevelItem(i)
+                if top.data(0, ROLE_PATH) == folder:
+                    self.tree.takeTopLevelItem(i)
+                    break
+            self._roots.discard(folder)
+            self._file_items = [
+                it for it in self._file_items if it.treeWidget() is not None
+            ]
+
         base = os.path.dirname(folder)
-        self._suggested_name = os.path.basename(folder)
+        self._building = True
+        top = QTreeWidgetItem(self.tree)
+        top.setText(0, os.path.basename(folder) or folder)
+        top.setIcon(0, folder_icon())
+        top.setData(0, ROLE_PATH, folder)
+        top.setData(0, ROLE_ISFILE, False)
+        top.setData(0, ROLE_SIZE, 0)
+        top.setText(2, folder)
+        top.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsAutoTristate
+        )
+        total = self._build_dir(top, folder, base)
+        top.setText(1, human_size(total))
+        top.setData(0, ROLE_SIZE, total)
+        top.setCheckState(0, Qt.CheckState.Checked)
+        top.setExpanded(True)
+        self._building = False
+
+        self._roots.add(folder)
+        self._suggested_name = os.path.basename(folder) or "архив"
         self._suggested_dir = base
-        added = self._add_records(make_items(files, base))
+        self._refresh_view()
         self.status.set_text(
-            f"Добавлено {added} {plural_files(added)} из «"
-            f"{os.path.basename(folder)}»",
+            f"Добавлена папка «{os.path.basename(folder)}»",
             self._last_target,
         )
 
-    def _clear_all(self):
-        if not self._records:
+    def _build_dir(self, parent_item, dirpath: str, base: str) -> int:
+        try:
+            entries = list(os.scandir(dirpath))
+        except OSError:
+            return 0
+        dirs, files = [], []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    dirs.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    files.append(e.path)
+            except OSError:
+                pass
+        dirs.sort(key=lambda s: os.path.basename(s).lower())
+        files.sort(key=lambda s: os.path.basename(s).lower())
+
+        total = 0
+        for d in dirs:
+            di = QTreeWidgetItem(parent_item)
+            di.setText(0, os.path.basename(d))
+            di.setIcon(0, folder_icon())
+            di.setData(0, ROLE_PATH, d)
+            di.setData(0, ROLE_ISFILE, False)
+            di.setText(2, d)
+            di.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsAutoTristate
+            )
+            sub_total = self._build_dir(di, d, base)
+            di.setText(1, human_size(sub_total))
+            di.setData(0, ROLE_SIZE, sub_total)
+            di.setCheckState(0, Qt.CheckState.Checked)
+            total += sub_total
+
+        for f in files:
+            try:
+                size = os.path.getsize(f)
+            except OSError:
+                size = 0
+            arc = os.path.relpath(f, base).replace(os.sep, "/")
+            fi = QTreeWidgetItem(parent_item)
+            fi.setText(0, os.path.basename(f))
+            fi.setIcon(0, tile_icon(f))
+            fi.setText(1, human_size(size))
+            fi.setText(2, os.path.dirname(f))
+            fi.setData(0, ROLE_PATH, f)
+            fi.setData(0, ROLE_SIZE, size)
+            fi.setData(0, ROLE_ARC, arc)
+            fi.setData(0, ROLE_ISFILE, True)
+            fi.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            fi.setCheckState(0, Qt.CheckState.Checked)
+            fi.setTextAlignment(
+                1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            self._file_items.append(fi)
+            total += size
+
+        return total
+
+    def add_single_file(self, path: str):
+        path = os.path.normpath(path)
+        if not os.path.isfile(path):
             return
-        self._records.clear()
+        if any(it.data(0, ROLE_PATH) == path for it in self._file_items):
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        self._building = True
+        fi = QTreeWidgetItem(self.tree)
+        fi.setText(0, os.path.basename(path))
+        fi.setIcon(0, tile_icon(path))
+        fi.setText(1, human_size(size))
+        fi.setText(2, os.path.dirname(path))
+        fi.setData(0, ROLE_PATH, path)
+        fi.setData(0, ROLE_SIZE, size)
+        fi.setData(0, ROLE_ARC, os.path.basename(path))
+        fi.setData(0, ROLE_ISFILE, True)
+        fi.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        fi.setCheckState(0, Qt.CheckState.Checked)
+        fi.setTextAlignment(
+            1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._file_items.append(fi)
+        self._building = False
+        if not self._suggested_dir:
+            self._suggested_dir = os.path.dirname(path)
+        self._refresh_view()
+
+    def _clear_all(self):
+        if self.tree.topLevelItemCount() == 0:
+            return
+        self.tree.clear()
+        self._file_items.clear()
+        self._roots.clear()
         self._suggested_name = ""
         self._suggested_dir = ""
-        self._refresh()
+        self._refresh_view()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        items: list[ArchiveItem] = []
         for url in event.mimeData().urls():
             local = url.toLocalFile()
             if not local:
                 continue
             if os.path.isdir(local):
-                items.extend(expand_folder(local))
-                self._suggested_name = os.path.basename(
-                    os.path.normpath(local)
-                )
-                self._suggested_dir = os.path.dirname(
-                    os.path.normpath(local)
-                )
+                self.add_folder_path(local)
             elif os.path.isfile(local):
-                items.append(make_item(local))
-        if items:
-            self._add_records(items)
+                self.add_single_file(local)
 
     def _on_select_all(self, value: bool):
-        for rec in self._records:
-            rec["checked"] = value
-        for row in self._rows:
-            row.checkbox.set_state(value)
-        self._update_summary()
+        state = (
+            Qt.CheckState.Checked if value else Qt.CheckState.Unchecked
+        )
+        self.tree.blockSignals(True)
+        for it in self._file_items:
+            it.setCheckState(0, state)
+        self.tree.blockSignals(False)
+        self._recompute_summary()
 
-    def _refresh(self):
-        while self.list_lay.count() > 1:
-            taken = self.list_lay.takeAt(0)
-            w = taken.widget()
-            if w is not None:
-                w.deleteLater()
-        self._rows.clear()
+    def _on_item_changed(self, _item, _column):
+        if self._building or self._summary_pending:
+            return
+        self._summary_pending = True
+        QTimer.singleShot(0, self._recompute_summary)
 
-        for idx, rec in enumerate(self._records):
-            row = FileRow(rec, idx, self._update_summary)
-            self._rows.append(row)
-            self.list_lay.insertWidget(idx, row)
-
-        has = bool(self._records)
+    def _refresh_view(self):
+        has = self.tree.topLevelItemCount() > 0
         self.stack.setCurrentIndex(1 if has else 0)
-        self.header.setVisible(has)
-        self._update_summary()
+        self._recompute_summary()
 
-    def _update_summary(self):
-        total = len(self._records)
-        checked = [r for r in self._records if r["checked"]]
-        sel = len(checked)
-        size = sum(r["size"] for r in checked)
+    def _recompute_summary(self):
+        self._summary_pending = False
+        total = len(self._file_items)
+        sel = 0
+        size = 0
+        for it in self._file_items:
+            if it.checkState(0) == Qt.CheckState.Checked:
+                sel += 1
+                size += int(it.data(0, ROLE_SIZE) or 0)
         self.bottom.set_summary(sel, size)
 
         if total == 0 or sel == 0:
-            self.header.checkbox.set_state(False)
+            self._sel_all.set_state(False)
         elif sel == total:
-            self.header.checkbox.set_state(True)
+            self._sel_all.set_state(True)
         else:
-            self.header.checkbox.set_state("mixed")
+            self._sel_all.set_state("mixed")
 
         if total == 0:
             self.status.set_text("Готово", "0 элементов")
@@ -1201,9 +1008,20 @@ class MainWindow(QWidget):
                 self._last_target,
             )
 
+    def _checked_items(self) -> list[ArchiveItem]:
+        out = []
+        for it in self._file_items:
+            if it.checkState(0) != Qt.CheckState.Checked:
+                continue
+            path = it.data(0, ROLE_PATH)
+            arc = it.data(0, ROLE_ARC) or os.path.basename(path)
+            size = int(it.data(0, ROLE_SIZE) or 0)
+            out.append(ArchiveItem(src=path, arcname=arc, size=size))
+        return out
+
     def _pack(self):
-        checked = [r for r in self._records if r["checked"]]
-        if not checked:
+        items = self._checked_items()
+        if not items:
             return
         base_name = self._suggested_name or "архив"
         init_dir = self._suggested_dir or os.path.expanduser("~")
@@ -1217,10 +1035,6 @@ class MainWindow(QWidget):
             target += ".zip"
         self._last_target = os.path.basename(target)
 
-        items = [
-            ArchiveItem(src=r["path"], arcname=r["arcname"], size=r["size"])
-            for r in checked
-        ]
         self.bottom.pack_btn.setEnabled(False)
         self._worker = PackWorker(target, items)
         self._worker.progress.connect(self._on_progress)
@@ -1250,7 +1064,7 @@ class MainWindow(QWidget):
 
     def _on_error(self, message: str):
         self.bottom.pack_btn.setEnabled(True)
-        self._update_summary()
+        self._recompute_summary()
         if message == "Упаковка отменена":
             self.status.set_text("Упаковка отменена", self._last_target)
             return
@@ -1310,11 +1124,41 @@ class MainWindow(QWidget):
         super().mousePressEvent(event)
 
 
+def _dark_palette() -> QPalette:
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(C_WINDOW))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(C_TEXT))
+    pal.setColor(QPalette.ColorRole.Base, QColor(C_PANEL))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(C_PANEL_ALT))
+    pal.setColor(QPalette.ColorRole.Text, QColor(C_TEXT))
+    pal.setColor(QPalette.ColorRole.Button, QColor(C_PANEL_ALT))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(C_TEXT))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(C_BAR))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(C_TEXT))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor(C_ACCENT))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("white"))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(C_TEXT_DIM))
+    return pal
+
+
 def run() -> int:
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "QuickZip.Desktop.App"
+            )
+        except Exception:
+            pass
+
     QApplication.setApplicationName("Quick Zip")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setPalette(_dark_palette())
+    icon = app_icon()
+    app.setWindowIcon(icon)
     win = MainWindow()
-    win.setWindowIcon(app_icon())
+    win.setWindowIcon(icon)
     win.show()
     return app.exec()
