@@ -12,6 +12,12 @@ env/
 dist/
 build/
 *.spec
+!QuickZip.spec
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
 
 # IDE
 .idea/

@@ -1,15 +1,12 @@
 @echo off
 setlocal
+chcp 65001 >nul
 
 set NAME=QuickZip
-set ICON_OPT=
-set DATA_OPT=
-if exist "assets\icons\app.ico" set ICON_OPT=--icon "assets\icons\app.ico"
-if exist "assets\icons\app.ico" set DATA_OPT=--add-data "assets\icons\app.ico;assets\icons"
 
 echo Сборка %NAME%.exe ...
 
-pyinstaller --noconfirm --clean --onefile --windowed --name %NAME% %ICON_OPT% %DATA_OPT% main.py
+pyinstaller --noconfirm --clean QuickZip.spec
 
 if errorlevel 1 (
     echo.

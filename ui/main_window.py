@@ -1,632 +1,69 @@
 from __future__ import annotations
 
-import base64
 import os
 import sys
-import tempfile
+import time
+from collections import deque
 
 from PyQt6.QtCore import (
-    QByteArray,
-    QPointF,
-    QRectF,
+    QLibraryInfo,
+    QLocale,
+    QPoint,
+    QProcess,
+    QSettings,
     QSize,
     Qt,
-    QThread,
     QTimer,
-    pyqtSignal,
+    QTranslator,
 )
-from PyQt6.QtGui import (
-    QColor,
-    QFont,
-    QGuiApplication,
-    QIcon,
-    QPainter,
-    QPainterPath,
-    QPalette,
-    QPen,
-    QPixmap,
-    QPolygonF,
-    QTransform,
-)
-from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QFileDialog,
-    QFileIconProvider,
-    QFrame,
-    QHBoxLayout,
     QHeaderView,
-    QLabel,
+    QMenu,
     QMessageBox,
-    QPushButton,
     QStackedWidget,
-    QTreeWidget,
-    QTreeWidgetItem,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
 
-from core.archiver import (
-    ArchiveItem,
-    create_zip,
+from core.formatting import (
+    human_duration,
     human_size,
+    human_speed,
     plural_files,
+    plural_items,
 )
-from ui.appicon_data import APPICON_PNG_B64
-
-C_CANVAS = "#0f0f0f"
-C_WINDOW = "#1a1a1a"
-C_BAR = "#202020"
-C_PANEL = "#252525"
-C_PANEL_ALT = "#2a2a2a"
-C_BORDER = "#333333"
-C_ACCENT = "#0078D4"
-C_ACCENT_HI = "#3A9BE5"
-C_ACCENT_BR = "#1A8AE0"
-C_TEXT = "#ffffff"
-C_TEXT_DIM = "#888888"
-C_TEXT_SOFT = "#cccccc"
-C_TEXT_FAINT = "#666666"
-C_GREEN = "#2BC27A"
-C_CLOSE = "#C42B1C"
-
-_TYPE_MAP = {
-    "jpg": ("#7B5EA7", "JPG"), "jpeg": ("#7B5EA7", "JPG"),
-    "png": ("#6A8B5A", "PNG"), "gif": ("#6A8B5A", "GIF"),
-    "bmp": ("#6A8B5A", "BMP"), "webp": ("#6A8B5A", "WEBP"),
-    "svg": ("#6A8B5A", "SVG"), "heic": ("#6A8B5A", "HEIC"),
-    "mp4": ("#C24A4A", "MP4"), "mov": ("#C24A4A", "MOV"),
-    "avi": ("#C24A4A", "AVI"), "mkv": ("#C24A4A", "MKV"),
-    "webm": ("#C24A4A", "WEBM"),
-    "mp3": ("#2E8B8B", "MP3"), "wav": ("#2E8B8B", "WAV"),
-    "flac": ("#2E8B8B", "FLAC"), "ogg": ("#2E8B8B", "OGG"),
-    "docx": ("#2B5BA0", "DOCX"), "doc": ("#2B5BA0", "DOC"),
-    "rtf": ("#2B5BA0", "RTF"),
-    "pdf": ("#B83A3A", "PDF"),
-    "xlsx": ("#1F7A4D", "XLSX"), "xls": ("#1F7A4D", "XLS"),
-    "csv": ("#1F7A4D", "CSV"),
-    "pptx": ("#C15D2E", "PPTX"), "ppt": ("#C15D2E", "PPT"),
-    "txt": ("#5A6470", "TXT"), "log": ("#5A6470", "LOG"),
-    "md": ("#5A6470", "MD"), "json": ("#5A6470", "JSON"),
-    "xml": ("#5A6470", "XML"), "yml": ("#5A6470", "YML"),
-    "yaml": ("#5A6470", "YAML"), "ini": ("#5A6470", "INI"),
-    "py": ("#3B6EA5", "PY"), "js": ("#C9A227", "JS"),
-    "ts": ("#2B7FBF", "TS"), "html": ("#C1502E", "HTML"),
-    "css": ("#2B6FB8", "CSS"), "sh": ("#4F7A4F", "SH"),
-    "sql": ("#8A6D3B", "SQL"),
-    "zip": ("#C9952B", "ZIP"), "rar": ("#C9952B", "RAR"),
-    "7z": ("#C9952B", "7Z"), "gz": ("#C9952B", "GZ"),
-    "tar": ("#C9952B", "TAR"),
-    "exe": ("#6B7280", "EXE"), "msi": ("#6B7280", "MSI"),
-    "dll": ("#6B7280", "DLL"), "iso": ("#7A6CA8", "ISO"),
-}
-
-_SVG = {
-    "add_folder": (
-        '<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
-        '<path d="M1.75 4.25C1.75 3.56 2.31 3 3 3h3.17c.33 0 .64.13.87.36l.85.85c.23.23.55.36.88.36H13c.69 0 1.25.56 1.25 1.25v6.43c0 .69-.56 1.25-1.25 1.25H3c-.69 0-1.25-.56-1.25-1.25V4.25Z" stroke="{c}" stroke-width="1.1" stroke-linejoin="round"/>'
-        '<path d="M8 8V11.5M6.25 9.75H9.75" stroke="{c}" stroke-width="1.1" stroke-linecap="round"/></svg>'
-    ),
-    "clear": (
-        '<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
-        '<path d="M3 4.5h10M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5M4.5 4.5l.6 8.1A1 1 0 0 0 6.1 13.5h3.8a1 1 0 0 0 1-.9l.6-8.1" stroke="{c}" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-    ),
-    "box": (
-        '<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">'
-        '<path d="M32 8L54 18V44L32 56L10 44V18L32 8Z" stroke="{c}" stroke-width="1.5" stroke-linejoin="round"/>'
-        '<path d="M10 18L32 28L54 18M32 28V56" stroke="{c}" stroke-width="1.5" stroke-linejoin="round"/>'
-        '<path d="M21 13L43 23" stroke="{c}" stroke-width="1.5" stroke-linejoin="round" stroke-dasharray="2 2"/></svg>'
-    ),
-    "chevron": (
-        '<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
-        '<path d="M6 4L10 8L6 12" stroke="{c}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-    ),
-}
-
-_tile_cache: dict[str, QIcon] = {}
-_folder_icon_cache: list[QIcon] = []
-_icon_provider: list[QFileIconProvider] = []
-_arrow_cache: list[tuple[str, str]] = []
-
-
-def asset_path(*parts: str) -> str:
-    if hasattr(sys, "_MEIPASS"):
-        root = sys._MEIPASS
-    else:
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, *parts)
-
-
-def _dpr() -> float:
-    screen = QGuiApplication.primaryScreen()
-    return screen.devicePixelRatio() if screen else 1.0
-
-
-def svg_icon(name: str, size: int, color: str) -> QPixmap:
-    ratio = _dpr()
-    px = max(1, int(size * ratio))
-    data = QByteArray(_SVG[name].format(c=color).encode("utf-8"))
-    renderer = QSvgRenderer(data)
-    pm = QPixmap(px, px)
-    pm.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pm)
-    renderer.render(painter)
-    painter.end()
-    pm.setDevicePixelRatio(ratio)
-    return pm
-
-
-def kind_of(path: str) -> str:
-    return os.path.splitext(path)[1].lstrip(".").lower()
-
-
-def file_tile(ext: str, size: int = 22) -> QPixmap:
-    info = _TYPE_MAP.get(ext)
-    if info:
-        color, label = info
-    elif ext:
-        color, label = "#5A6470", ext.upper()[:4]
-    else:
-        color, label = "#5A6470", ""
-
-    ratio = _dpr()
-    px = int(size * ratio)
-    pm = QPixmap(px, px)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.scale(ratio, ratio)
-
-    base = QColor(color)
-    rect = QRectF(0.5, 0.5, size - 1, size - 1)
-    body = QPainterPath()
-    body.addRoundedRect(rect, 5, 5)
-    p.fillPath(body, base)
-
-    fold = 7
-    tri = QPolygonF([
-        QPointF(size - fold, 0.5),
-        QPointF(size - 0.5, 0.5),
-        QPointF(size - 0.5, fold),
-    ])
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(base.darker(140))
-    p.drawPolygon(tri)
-    p.setPen(QPen(base.lighter(118), 1))
-    p.drawLine(QPointF(size - fold, 0.5), QPointF(size - fold, fold))
-    p.drawLine(QPointF(size - fold, fold), QPointF(size - 0.5, fold))
-
-    if label:
-        f = QFont("Segoe UI")
-        f.setBold(True)
-        f.setPixelSize(8 if len(label) <= 3 else 6)
-        p.setFont(f)
-        p.setPen(QColor("white"))
-        p.drawText(QRectF(0, 1, size, size - 1),
-                   Qt.AlignmentFlag.AlignCenter, label)
-    else:
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255, 215))
-        line_w = size * 0.5
-        x = (size - line_w) / 2
-        for i, y in enumerate((size * 0.34, size * 0.5, size * 0.66)):
-            w = line_w if i < 2 else line_w * 0.6
-            p.drawRoundedRect(QRectF(x, y, w, 1.8), 1, 1)
-
-    p.end()
-    pm.setDevicePixelRatio(ratio)
-    return pm
-
-
-def tile_icon(path: str) -> QIcon:
-    ext = kind_of(path)
-    key = ext or "_"
-    icon = _tile_cache.get(key)
-    if icon is None:
-        icon = QIcon(file_tile(ext))
-        _tile_cache[key] = icon
-    return icon
-
-
-def folder_icon() -> QIcon:
-    if not _folder_icon_cache:
-        if not _icon_provider:
-            _icon_provider.append(QFileIconProvider())
-        _folder_icon_cache.append(
-            _icon_provider[0].icon(QFileIconProvider.IconType.Folder)
-        )
-    return _folder_icon_cache[0]
-
-
-def app_icon() -> QIcon:
-    ico = asset_path("assets", "icons", "app.ico")
-    if os.path.exists(ico):
-        disk = QIcon(ico)
-        if not disk.isNull() and disk.availableSizes():
-            return disk
-    pm = QPixmap()
-    pm.loadFromData(base64.b64decode(APPICON_PNG_B64), "PNG")
-    icon = QIcon()
-    for s in (16, 20, 24, 32, 48, 64, 128, 256):
-        icon.addPixmap(
-            pm.scaled(
-                s, s,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-    return icon
-
-
-def branch_arrows() -> tuple[str, str]:
-    if _arrow_cache:
-        return _arrow_cache[0]
-    folder = os.path.join(tempfile.gettempdir(), "quickzip_ui")
-    os.makedirs(folder, exist_ok=True)
-    closed_path = os.path.join(folder, "arrow_closed.png")
-    open_path = os.path.join(folder, "arrow_open.png")
-    right = svg_icon("chevron", 13, "#c8c8c8")
-    right.save(closed_path, "PNG")
-    down = right.transformed(
-        QTransform().rotate(90), Qt.TransformationMode.SmoothTransformation
-    )
-    down.save(open_path, "PNG")
-    result = (
-        closed_path.replace(os.sep, "/"),
-        open_path.replace(os.sep, "/"),
-    )
-    _arrow_cache.append(result)
-    return result
-
-
-class TriCheckBox(QWidget):
-    toggled = pyqtSignal(bool)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._state = False
-        self.setFixedSize(20, 20)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def state(self):
-        return self._state
-
-    def set_state(self, value):
-        if self._state != value:
-            self._state = value
-            self.update()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            new = not (self._state is True)
-            self._state = new
-            self.update()
-            self.toggled.emit(new)
-
-    def paintEvent(self, _event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        active = self._state is True or self._state == "mixed"
-        rect = QRectF(1, 1, 18, 18)
-        path = QPainterPath()
-        path.addRoundedRect(rect, 3, 3)
-        if active:
-            p.fillPath(path, QColor(C_ACCENT))
-            p.setPen(QPen(QColor(C_ACCENT), 1))
-        else:
-            p.fillPath(path, QColor(C_WINDOW))
-            p.setPen(QPen(QColor("#555555"), 1.5))
-        p.drawPath(path)
-
-        if self._state is True:
-            pen = QPen(QColor("white"), 2)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            p.setPen(pen)
-            poly = QPolygonF([
-                QPointF(5, 10), QPointF(8, 13), QPointF(15, 6),
-            ])
-            p.drawPolyline(poly)
-        elif self._state == "mixed":
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("white"))
-            p.drawRoundedRect(QRectF(5, 9, 10, 2), 1, 1)
-        p.end()
-
-
-class ToolbarButton(QPushButton):
-    def __init__(self, icon_name: str, text: str, parent=None):
-        super().__init__(text, parent)
-        self.setIcon(QIcon(svg_icon(icon_name, 16, C_ACCENT_HI)))
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet(
-            f"""
-            QPushButton {{
-                background: {C_PANEL_ALT};
-                border: 1px solid {C_BORDER};
-                border-radius: 4px;
-                padding: 7px 14px;
-                color: {C_TEXT};
-                font-size: 13px;
-                text-align: left;
-            }}
-            QPushButton:hover {{ background: #323232; }}
-            QPushButton:pressed {{ background: #2f2f2f; }}
-            """
-        )
-
-
-class CaptionButton(QPushButton):
-    def __init__(self, glyph: str, close=False, parent=None):
-        super().__init__(glyph, parent)
-        self.setFixedSize(46, 32)
-        hover = C_CLOSE if close else "#3a3a3a"
-        self.setStyleSheet(
-            f"""
-            QPushButton {{
-                background: transparent; border: none;
-                color: {C_TEXT_DIM}; font-size: 11px;
-                font-family: 'Segoe UI Symbol';
-            }}
-            QPushButton:hover {{ background: {hover}; color: white; }}
-            """
-        )
-
-
-class TitleBar(QWidget):
-    def __init__(self, window: "MainWindow"):
-        super().__init__(window)
-        self._win = window
-        self.setFixedHeight(32)
-        self.setObjectName("titlebar")
-        self.setStyleSheet(
-            f"#titlebar {{ background: {C_BAR}; "
-            f"border-bottom: 1px solid {C_BORDER}; }}"
-        )
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 0, 0, 0)
-        lay.setSpacing(8)
-
-        glyph = QLabel()
-        glyph.setFixedSize(18, 18)
-        glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        glyph.setPixmap(
-            app_icon().pixmap(QSize(18, 18))
-        )
-        lay.addWidget(glyph)
-
-        title = QLabel("Quick Zip")
-        title.setStyleSheet(f"color: {C_TEXT}; font-size: 12px;")
-        lay.addWidget(title)
-        lay.addStretch(1)
-
-        self._btn_min = CaptionButton("—")
-        self._btn_max = CaptionButton("□")
-        self._btn_close = CaptionButton("✕", close=True)
-        self._btn_min.clicked.connect(window.showMinimized)
-        self._btn_max.clicked.connect(window.toggle_max_restore)
-        self._btn_close.clicked.connect(window.close)
-        for b in (self._btn_min, self._btn_max, self._btn_close):
-            lay.addWidget(b)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            handle = self._win.windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
-
-    def mouseDoubleClickEvent(self, _event):
-        self._win.toggle_max_restore()
-
-
-class EmptyState(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setStyleSheet(f"EmptyState {{ background: {C_WINDOW}; }}")
-        outer = QVBoxLayout(self)
-        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        zone = QFrame()
-        zone.setObjectName("zone")
-        zone.setFixedWidth(440)
-        zone.setStyleSheet(
-            "#zone { border: 2px dashed #3a4a5e; border-radius: 8px; "
-            f"background: {C_BAR}; }}"
-        )
-        zlay = QVBoxLayout(zone)
-        zlay.setContentsMargins(32, 44, 32, 44)
-        zlay.setSpacing(18)
-        zlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        badge = QLabel()
-        badge.setFixedSize(80, 80)
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setStyleSheet(
-            "background: rgba(0,120,212,0.12); border-radius: 16px;"
-        )
-        badge.setPixmap(svg_icon("box", 44, C_ACCENT_HI))
-        zlay.addWidget(badge, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        title = QLabel("Перетащите папку сюда")
-        title.setStyleSheet(
-            f"color: {C_TEXT}; font-size: 16px; font-weight: 600;"
-        )
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        zlay.addWidget(title)
-
-        sub = QLabel(
-            'или нажмите <span style="color:#3A9BE5;font-weight:600;">'
-            "Добавить папку</span>, чтобы начать"
-        )
-        sub.setTextFormat(Qt.TextFormat.RichText)
-        sub.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 13px;")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        zlay.addWidget(sub)
-
-        hint = QLabel("Папки можно раскрывать и отмечать файлы галочками")
-        hint.setStyleSheet(
-            f"color: {C_TEXT_FAINT}; font-size: 11px; "
-            f"border-top: 1px solid {C_PANEL_ALT}; padding-top: 10px;"
-        )
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        zlay.addWidget(hint)
-
-        outer.addWidget(zone)
-
-
-class BottomPanel(QWidget):
-    pack_requested = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.setObjectName("bottom")
-        self.setStyleSheet(
-            f"#bottom {{ background: {C_PANEL}; "
-            f"border-top: 1px solid {C_BORDER}; }}"
-        )
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(18, 14, 18, 14)
-
-        left = QVBoxLayout()
-        left.setSpacing(2)
-        self.summary = QLabel()
-        self.summary.setStyleSheet(f"font-size: 13px; color: {C_TEXT};")
-        self.estimate = QLabel()
-        self.estimate.setStyleSheet(f"font-size: 11px; color: {C_TEXT_FAINT};")
-        left.addWidget(self.summary)
-        left.addWidget(self.estimate)
-        lay.addLayout(left)
-        lay.addStretch(1)
-
-        self.pack_btn = QPushButton("Упаковать в ZIP")
-        self.pack_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.pack_btn.setIcon(QIcon(svg_icon("chevron", 14, "white")))
-        self.pack_btn.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.pack_btn.clicked.connect(self.pack_requested.emit)
-        lay.addWidget(self.pack_btn)
-        self.set_summary(0, 0)
-
-    def set_summary(self, count: int, total_bytes: int):
-        enabled = count > 0
-        self.pack_btn.setEnabled(enabled)
-        if enabled:
-            self.summary.setText(
-                f'<span style="color:{C_TEXT_DIM};">Выбрано: </span>'
-                f"<b>{count}</b>"
-                f'<span style="color:{C_TEXT_DIM};"> {plural_files(count)} '
-                f"({human_size(total_bytes)})</span>"
-            )
-            approx = int(total_bytes * 0.78)
-            secs = max(1, round(total_bytes / (35 * 1024 * 1024)))
-            self.estimate.setText(
-                f"≈ {human_size(approx)} после сжатия · ~{secs} сек"
-            )
-        else:
-            self.summary.setText(
-                f'<span style="color:{C_TEXT_DIM};">Выбрано: </span><b>0</b>'
-                f'<span style="color:{C_TEXT_DIM};"> файлов</span>'
-            )
-            self.estimate.setText("Добавьте папку, чтобы начать")
-        self._restyle(enabled)
-
-    def _restyle(self, enabled: bool):
-        if enabled:
-            self.pack_btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background: {C_ACCENT};
-                    border: 1px solid {C_ACCENT_BR};
-                    border-radius: 4px; padding: 11px 22px;
-                    color: white; font-size: 14px; font-weight: 600;
-                }}
-                QPushButton:hover {{ background: #1A8AE0; }}
-                QPushButton:pressed {{ background: #006ABE; }}
-                """
-            )
-        else:
-            self.pack_btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background: {C_BORDER}; border: 1px solid #3a3a3a;
-                    border-radius: 4px; padding: 11px 22px;
-                    color: {C_TEXT_FAINT}; font-size: 14px; font-weight: 600;
-                }}
-                """
-            )
-
-
-class StatusBar(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(24)
-        self.setObjectName("status")
-        self.setStyleSheet(
-            f"#status {{ background: {C_BAR}; "
-            f"border-top: 1px solid {C_BORDER}; }}"
-            f"QLabel {{ color: {C_TEXT_DIM}; font-size: 11px; }}"
-        )
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 0, 12, 0)
-        lay.setSpacing(8)
-
-        dot = QLabel()
-        dot.setFixedSize(6, 6)
-        dot.setStyleSheet(f"background: {C_GREEN}; border-radius: 3px;")
-        lay.addWidget(dot)
-        self.left = QLabel("Готово")
-        lay.addWidget(self.left)
-        lay.addStretch(1)
-        self.right = QLabel("0 элементов")
-        lay.addWidget(self.right)
-
-    def set_text(self, left: str, right: str):
-        self.left.setText(left)
-        self.right.setText(right)
-
-
-class PackWorker(QThread):
-    progress = pyqtSignal(int, int, str)
-    done = pyqtSignal(int)
-    error = pyqtSignal(str)
-
-    def __init__(self, zip_path: str, items: list[ArchiveItem]):
-        super().__init__()
-        self._zip_path = zip_path
-        self._items = items
-        self._cancel = False
-
-    def cancel(self):
-        self._cancel = True
-
-    def run(self):
-        try:
-            written = create_zip(
-                self._zip_path,
-                self._items,
-                progress=lambda d, t, n: self.progress.emit(d, t, n),
-                should_cancel=lambda: self._cancel,
-            )
-            self.done.emit(written)
-        except InterruptedError:
-            self.error.emit("Упаковка отменена")
-        except Exception as exc:
-            self.error.emit(str(exc))
-
-
-ROLE_PATH = Qt.ItemDataRole.UserRole
-ROLE_SIZE = Qt.ItemDataRole.UserRole + 1
-ROLE_ARC = Qt.ItemDataRole.UserRole + 2
-ROLE_ISFILE = Qt.ItemDataRole.UserRole + 3
-
+from core.packer import PackOptions, PackResult, default_workers
+from core.scanner import Node, collect_items, summary
+from ui.file_model import FileTreeModel
+from ui.icons import app_icon
+from ui.style import TreeStyle
+from ui.theme import APP_QSS, C_WINDOW, MENU_QSS, TREE_QSS, dark_palette
+from ui.widgets import (
+    MIXED,
+    BottomPanel,
+    EmptyState,
+    StatusBar,
+    TitleBar,
+    Toolbar,
+    TriCheckBox,
+)
+from ui.workers import PackWorker, ScanWorker
+
+APP_NAME = "Quick Zip"
+APP_VERSION = "1.2.0"
 RESIZE_MARGIN = 5
+IDLE, SCANNING, PACKING = 0, 1, 2
 
 
 class MainWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Quick Zip")
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(APP_NAME)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setMinimumSize(800, 600)
         self.resize(1040, 700)
@@ -635,486 +72,506 @@ class MainWindow(QWidget):
         self.setObjectName("root")
         self.setStyleSheet(f"#root {{ background: {C_WINDOW}; }}")
 
-        self._file_items: list[QTreeWidgetItem] = []
-        self._roots: set[str] = set()
-        self._worker: PackWorker | None = None
-        self._building = False
-        self._summary_pending = False
+        self._settings = QSettings("QuickZip", "QuickZip")
+        self._state = IDLE
+        self._scan_queue: deque[tuple[str, bool]] = deque()
+        self._scanner: ScanWorker | None = None
+        self._packer: PackWorker | None = None
         self._suggested_name = ""
         self._suggested_dir = ""
-        self._last_target = "архив.zip"
+        self._target_name = "архив.zip"
+        self._pack_started = 0.0
+        self._closing = False
+        self._note = ""
+        self._note_timer = QTimer(self)
+        self._note_timer.setSingleShot(True)
+        self._note_timer.timeout.connect(self._clear_note)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(
+        self.model = FileTreeModel(self)
+        self.model.selection_changed.connect(self._refresh_summary)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(
             RESIZE_MARGIN, RESIZE_MARGIN, RESIZE_MARGIN, RESIZE_MARGIN
         )
-        root.setSpacing(0)
+        layout.setSpacing(0)
 
         self.title_bar = TitleBar(self)
-        root.addWidget(self.title_bar)
-        root.addWidget(self._build_toolbar())
+        self.title_bar.minimize_requested.connect(self.showMinimized)
+        self.title_bar.maximize_requested.connect(self.toggle_max_restore)
+        self.title_bar.close_requested.connect(self.close)
+        self.title_bar.move_requested.connect(self._start_move)
+        layout.addWidget(self.title_bar)
+
+        self.toolbar = Toolbar(self)
+        self.toolbar.add_folder_requested.connect(self._choose_folder)
+        self.toolbar.add_files_requested.connect(self._choose_files)
+        self.toolbar.clear_requested.connect(self._clear_all)
+        self.toolbar.level_changed.connect(self._on_level_changed)
+        layout.addWidget(self.toolbar)
 
         self.stack = QStackedWidget()
         self.empty = EmptyState()
-        self.tree = self._build_tree()
+        self.view = self._build_view()
         self.stack.addWidget(self.empty)
-        self.stack.addWidget(self.tree)
-        root.addWidget(self.stack, 1)
+        self.stack.addWidget(self.view)
+        layout.addWidget(self.stack, 1)
 
         self.bottom = BottomPanel()
-        self.bottom.pack_requested.connect(self._pack)
-        root.addWidget(self.bottom)
+        self.bottom.pack_requested.connect(self._start_pack)
+        self.bottom.cancel_requested.connect(self._cancel_current)
+        layout.addWidget(self.bottom)
 
         self.status = StatusBar()
-        root.addWidget(self.status)
+        layout.addWidget(self.status)
 
-        self._refresh_view()
+        self._restore_settings()
+        self._install_shortcuts()
+        self._refresh_summary()
 
-    def _build_toolbar(self) -> QWidget:
-        bar = QWidget()
-        bar.setObjectName("toolbar")
-        bar.setStyleSheet(
-            f"#toolbar {{ background: {C_PANEL}; "
-            f"border-bottom: 1px solid {C_BORDER}; }}"
+    def _build_view(self) -> QTreeView:
+        view = QTreeView()
+        view.setModel(self.model)
+        self._tree_style = TreeStyle()
+        self._tree_style.setParent(view)
+        view.setStyle(self._tree_style)
+        view.setStyleSheet(TREE_QSS)
+        view.setUniformRowHeights(True)
+        view.setAlternatingRowColors(True)
+        view.setIndentation(16)
+        view.setIconSize(QSize(22, 22))
+        view.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        view.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(14, 10, 14, 10)
-        lay.setSpacing(8)
-
-        b_add = ToolbarButton("add_folder", "Добавить папку")
-        b_add.clicked.connect(self._add_folder)
-        sep = QFrame()
-        sep.setFixedSize(1, 22)
-        sep.setStyleSheet(f"background: {C_BORDER};")
-        b_clear = ToolbarButton("clear", "Очистить всё")
-        b_clear.clicked.connect(self._clear_all)
-
-        lay.addWidget(b_add)
-        lay.addSpacing(4)
-        lay.addWidget(sep)
-        lay.addSpacing(4)
-        lay.addWidget(b_clear)
-        lay.addStretch(1)
-        return bar
-
-    def _build_tree(self) -> QTreeWidget:
-        tree = QTreeWidget()
-        tree.setColumnCount(3)
-        tree.setHeaderHidden(False)
-        tree.setHeaderLabels(["Имя", "Размер", "Путь"])
-        tree.setUniformRowHeights(True)
-        tree.setAlternatingRowColors(True)
-        tree.setIndentation(16)
-        tree.setIconSize(QSize(22, 22))
-        tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        tree.setSelectionMode(
-            QAbstractItemView.SelectionMode.NoSelection
+        view.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
         )
-        tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        tree.headerItem().setTextAlignment(
-            1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        view.setExpandsOnDoubleClick(True)
+        view.setAllColumnsShowFocus(True)
+        view.setSortingEnabled(False)
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(self._show_context_menu)
+        view.expanded.connect(
+            lambda index: self.model.set_expanded(index, True)
+        )
+        view.collapsed.connect(
+            lambda index: self.model.set_expanded(index, False)
         )
 
-        hdr = tree.header()
-        hdr.setFixedHeight(38)
-        hdr.setStretchLastSection(False)
-        hdr.setSortIndicatorShown(False)
-        hdr.setSectionsClickable(False)
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        tree.setColumnWidth(1, 110)
-        tree.setColumnWidth(2, 300)
+        header = view.header()
+        header.setFixedHeight(38)
+        header.setStretchLastSection(False)
+        header.setSortIndicatorShown(False)
+        header.setSectionsClickable(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        view.setColumnWidth(1, 110)
+        view.setColumnWidth(2, 300)
 
-        tree.itemChanged.connect(self._on_item_changed)
-        arrow_closed, arrow_open = branch_arrows()
-        tree.setStyleSheet(
-            f"""
-            QTreeWidget {{
-                background: {C_PANEL};
-                alternate-background-color: {C_PANEL_ALT};
-                color: {C_TEXT}; font-size: 13px;
-                border: none; outline: none;
-            }}
-            QHeaderView {{ background: {C_BAR}; }}
-            QHeaderView::section {{
-                background: {C_BAR}; color: {C_TEXT_DIM};
-                font-size: 12px; font-weight: 600;
-                border: 0px; border-bottom: 1px solid {C_BORDER};
-                padding: 0 10px;
-            }}
-            QHeaderView::section:first {{ padding-left: 46px; }}
-            QTreeView::item {{ height: 30px; border: none; }}
-            QTreeView::item:hover {{ background: #2c2f33; }}
-            QTreeView::item:selected {{
-                background: transparent; color: {C_TEXT};
-            }}
-            QTreeView::branch {{ background: transparent; }}
-            QTreeView::branch:selected, QTreeView::branch:hover {{
-                background: transparent;
-            }}
-            QTreeView::branch:has-children:closed {{
-                image: url("{arrow_closed}");
-            }}
-            QTreeView::branch:has-children:open {{
-                image: url("{arrow_open}");
-            }}
-            QScrollBar:vertical {{
-                background: {C_WINDOW}; width: 10px; margin: 0;
-            }}
-            QScrollBar::handle:vertical {{
-                background: #3a3a3a; border-radius: 5px; min-height: 30px;
-            }}
-            QScrollBar::handle:vertical:hover {{ background: #4a4a4a; }}
-            QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-            QScrollBar:horizontal {{
-                background: {C_WINDOW}; height: 10px; margin: 0;
-            }}
-            QScrollBar::handle:horizontal {{
-                background: #3a3a3a; border-radius: 5px; min-width: 30px;
-            }}
-            """
+        self.select_all_box = TriCheckBox(header)
+        self.select_all_box.setGeometry(15, 9, 20, 20)
+        self.select_all_box.toggled.connect(self.model.set_all_checked)
+        self.select_all_box.raise_()
+        return view
+
+    def _install_shortcuts(self) -> None:
+        bindings = (
+            ("Ctrl+O", self._choose_folder),
+            ("Ctrl+Shift+O", self._choose_files),
+            ("Ctrl+Shift+Delete", self._clear_all),
+            ("Ctrl+Return", self._start_pack),
+            ("Ctrl+A", lambda: self.model.set_all_checked(True)),
+            ("Ctrl+D", lambda: self.model.set_all_checked(False)),
+            ("Delete", self._remove_selected),
+            ("F5", self._rescan_roots),
+            ("Escape", self._cancel_current),
         )
+        for key, handler in bindings:
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(handler)
 
-        self._sel_all = TriCheckBox(hdr)
-        self._sel_all.setGeometry(15, 9, 20, 20)
-        self._sel_all.toggled.connect(self._on_select_all)
-        self._sel_all.raise_()
-        return tree
+    def _restore_settings(self) -> None:
+        geometry = self._settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        level = self._settings.value("pack/level", 6, type=int)
+        self.toolbar.set_level(level)
+        self.bottom.set_level(self.toolbar.level())
+        self._suggested_dir = self._settings.value("pack/last_dir", "",
+                                                   type=str)
 
-    def _add_folder(self):
+    def _save_settings(self) -> None:
+        self._settings.setValue("window/geometry", self.saveGeometry())
+        self._settings.setValue("pack/level", self.toolbar.level())
+        self._settings.setValue("pack/last_dir", self._suggested_dir)
+
+    def _on_level_changed(self, level: int) -> None:
+        self.bottom.set_level(level)
+        self._refresh_summary()
+
+    def add_path(self, path: str) -> None:
+        path = os.path.normpath(path)
+        if os.path.isdir(path):
+            self._scan_queue.append((path, False))
+        elif os.path.isfile(path):
+            self._scan_queue.append((path, True))
+        else:
+            return
+        self._start_next_scan()
+
+    def _choose_folder(self) -> None:
+        if self._state != IDLE:
+            return
         folder = QFileDialog.getExistingDirectory(
-            self, "Выберите папку"
+            self, "Выберите папку", self._suggested_dir
         )
         if folder:
-            self.add_folder_path(folder)
+            self.add_path(folder)
 
-    def add_folder_path(self, folder: str):
-        folder = os.path.normpath(folder)
-        if not os.path.isdir(folder):
+    def _choose_files(self) -> None:
+        if self._state != IDLE:
             return
-        if folder in self._roots:
-            for i in range(self.tree.topLevelItemCount()):
-                top = self.tree.topLevelItem(i)
-                if top.data(0, ROLE_PATH) == folder:
-                    self.tree.takeTopLevelItem(i)
-                    break
-            self._roots.discard(folder)
-            self._file_items = [
-                it for it in self._file_items if it.treeWidget() is not None
-            ]
-
-        base = os.path.dirname(folder)
-        self._building = True
-        top = QTreeWidgetItem(self.tree)
-        top.setText(0, os.path.basename(folder) or folder)
-        top.setIcon(0, folder_icon())
-        top.setData(0, ROLE_PATH, folder)
-        top.setData(0, ROLE_ISFILE, False)
-        top.setData(0, ROLE_SIZE, 0)
-        top.setText(2, folder)
-        top.setFlags(
-            Qt.ItemFlag.ItemIsEnabled
-            | Qt.ItemFlag.ItemIsSelectable
-            | Qt.ItemFlag.ItemIsUserCheckable
-            | Qt.ItemFlag.ItemIsAutoTristate
+        paths, _filter = QFileDialog.getOpenFileNames(
+            self, "Выберите файлы", self._suggested_dir
         )
-        total = self._build_dir(top, folder, base)
-        top.setText(1, human_size(total))
-        top.setData(0, ROLE_SIZE, total)
-        top.setCheckState(0, Qt.CheckState.Checked)
-        top.setExpanded(True)
-        self._building = False
+        for path in paths:
+            self.add_path(path)
 
-        self._roots.add(folder)
-        self._suggested_name = os.path.basename(folder) or "архив"
-        self._suggested_dir = base
-        self._refresh_view()
-        self.status.set_text(
-            f"Добавлена папка «{os.path.basename(folder)}»",
-            self._last_target,
-        )
-
-    def _build_dir(self, parent_item, dirpath: str, base: str) -> int:
-        try:
-            entries = list(os.scandir(dirpath))
-        except OSError:
-            return 0
-        dirs, files = [], []
-        for e in entries:
-            try:
-                if e.is_dir(follow_symlinks=False):
-                    dirs.append(e.path)
-                elif e.is_file(follow_symlinks=False):
-                    files.append(e.path)
-            except OSError:
-                pass
-        dirs.sort(key=lambda s: os.path.basename(s).lower())
-        files.sort(key=lambda s: os.path.basename(s).lower())
-
-        total = 0
-        for d in dirs:
-            di = QTreeWidgetItem(parent_item)
-            di.setText(0, os.path.basename(d))
-            di.setIcon(0, folder_icon())
-            di.setData(0, ROLE_PATH, d)
-            di.setData(0, ROLE_ISFILE, False)
-            di.setText(2, d)
-            di.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsAutoTristate
-            )
-            sub_total = self._build_dir(di, d, base)
-            di.setText(1, human_size(sub_total))
-            di.setData(0, ROLE_SIZE, sub_total)
-            di.setCheckState(0, Qt.CheckState.Checked)
-            total += sub_total
-
-        for f in files:
-            try:
-                size = os.path.getsize(f)
-            except OSError:
-                size = 0
-            arc = os.path.relpath(f, base).replace(os.sep, "/")
-            fi = QTreeWidgetItem(parent_item)
-            fi.setText(0, os.path.basename(f))
-            fi.setIcon(0, tile_icon(f))
-            fi.setText(1, human_size(size))
-            fi.setText(2, os.path.dirname(f))
-            fi.setData(0, ROLE_PATH, f)
-            fi.setData(0, ROLE_SIZE, size)
-            fi.setData(0, ROLE_ARC, arc)
-            fi.setData(0, ROLE_ISFILE, True)
-            fi.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsUserCheckable
-            )
-            fi.setCheckState(0, Qt.CheckState.Checked)
-            fi.setTextAlignment(
-                1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            self._file_items.append(fi)
-            total += size
-
-        return total
-
-    def add_single_file(self, path: str):
-        path = os.path.normpath(path)
-        if not os.path.isfile(path):
+    def _start_next_scan(self) -> None:
+        if self._scanner is not None or not self._scan_queue:
             return
-        if any(it.data(0, ROLE_PATH) == path for it in self._file_items):
-            return
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
-        self._building = True
-        fi = QTreeWidgetItem(self.tree)
-        fi.setText(0, os.path.basename(path))
-        fi.setIcon(0, tile_icon(path))
-        fi.setText(1, human_size(size))
-        fi.setText(2, os.path.dirname(path))
-        fi.setData(0, ROLE_PATH, path)
-        fi.setData(0, ROLE_SIZE, size)
-        fi.setData(0, ROLE_ARC, os.path.basename(path))
-        fi.setData(0, ROLE_ISFILE, True)
-        fi.setFlags(
-            Qt.ItemFlag.ItemIsEnabled
-            | Qt.ItemFlag.ItemIsSelectable
-            | Qt.ItemFlag.ItemIsUserCheckable
-        )
-        fi.setCheckState(0, Qt.CheckState.Checked)
-        fi.setTextAlignment(
-            1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._file_items.append(fi)
-        self._building = False
-        if not self._suggested_dir:
-            self._suggested_dir = os.path.dirname(path)
-        self._refresh_view()
+        path, as_file = self._scan_queue.popleft()
+        worker = ScanWorker(path, as_file, self)
+        worker.scanned.connect(self._on_scanned)
+        worker.progress.connect(self.bottom.set_scanning)
+        worker.failed.connect(self._on_scan_failed)
+        worker.cancelled.connect(self._on_scan_cancelled)
+        worker.finished.connect(self._on_scan_finished)
+        self._scanner = worker
+        self._set_state(SCANNING)
+        self.status.set_text(f"Сканирование «{os.path.basename(path)}»…")
+        worker.start()
 
-    def _clear_all(self):
-        if self.tree.topLevelItemCount() == 0:
+    def _on_scanned(self, node: Node) -> None:
+        existing = self.model.find_root(node.root_path)
+        if existing >= 0:
+            self.model.remove_root(existing)
+        index = self.model.add_root(node)
+        if node.is_dir:
+            self.view.expand(index)
+            self._suggested_name = node.name or "архив"
+            self._suggested_dir = os.path.dirname(node.root_path)
+        elif not self._suggested_dir:
+            self._suggested_dir = os.path.dirname(node.root_path)
+        if not self._suggested_name:
+            self._suggested_name = node.name or "архив"
+        self._set_note(f"Добавлено: «{node.name}»")
+
+    def _on_scan_failed(self, message: str) -> None:
+        self._set_note(f"Ошибка чтения: {message}")
+
+    def _on_scan_cancelled(self) -> None:
+        self._scan_queue.clear()
+        self._set_note("Сканирование отменено")
+
+    def _on_scan_finished(self) -> None:
+        self._scanner = None
+        if self._scan_queue:
+            self._start_next_scan()
             return
-        self.tree.clear()
-        self._file_items.clear()
-        self._roots.clear()
+        self._set_state(IDLE)
+        self._refresh_summary()
+
+    def _rescan_roots(self) -> None:
+        if self._state != IDLE or self.model.is_empty():
+            return
+        paths = [
+            (node.root_path, not node.is_dir) for node in self.model.roots
+        ]
+        self.model.clear()
+        self._scan_queue.extend(paths)
+        self._start_next_scan()
+
+    def _clear_all(self) -> None:
+        if self._state != IDLE:
+            return
+        self.model.clear()
         self._suggested_name = ""
-        self._suggested_dir = ""
-        self._refresh_view()
+        self._refresh_summary()
+        self._set_note("Список очищен")
 
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        for url in event.mimeData().urls():
-            local = url.toLocalFile()
-            if not local:
-                continue
-            if os.path.isdir(local):
-                self.add_folder_path(local)
-            elif os.path.isfile(local):
-                self.add_single_file(local)
-
-    def _on_select_all(self, value: bool):
-        state = (
-            Qt.CheckState.Checked if value else Qt.CheckState.Unchecked
-        )
-        self.tree.blockSignals(True)
-        for it in self._file_items:
-            it.setCheckState(0, state)
-        self.tree.blockSignals(False)
-        self._recompute_summary()
-
-    def _on_item_changed(self, _item, _column):
-        if self._building or self._summary_pending:
+    def _remove_selected(self) -> None:
+        if self._state != IDLE:
             return
-        self._summary_pending = True
-        QTimer.singleShot(0, self._recompute_summary)
+        indexes = [
+            index for index in self.view.selectionModel().selectedRows()
+            if index.isValid()
+        ]
+        if not indexes:
+            return
+        self.model.remove_indexes(indexes)
+        self._refresh_summary()
 
-    def _refresh_view(self):
-        has = self.tree.topLevelItemCount() > 0
-        self.stack.setCurrentIndex(1 if has else 0)
-        self._recompute_summary()
+    def _show_context_menu(self, position: QPoint) -> None:
+        index = self.view.indexAt(position)
+        menu = QMenu(self)
+        menu.setStyleSheet(MENU_QSS)
+        if index.isValid():
+            node = self.model.node_at(index)
+            open_action = QAction("Показать в проводнике", menu)
+            open_action.triggered.connect(lambda: self._reveal(node.path))
+            menu.addAction(open_action)
+            remove_action = QAction("Убрать из списка", menu)
+            remove_action.triggered.connect(self._remove_selected)
+            menu.addAction(remove_action)
+            menu.addSeparator()
+        expand_action = QAction("Развернуть всё", menu)
+        expand_action.triggered.connect(self.view.expandAll)
+        menu.addAction(expand_action)
+        collapse_action = QAction("Свернуть всё", menu)
+        collapse_action.triggered.connect(self.view.collapseAll)
+        menu.addAction(collapse_action)
+        menu.addSeparator()
+        clear_action = QAction("Очистить всё", menu)
+        clear_action.triggered.connect(self._clear_all)
+        menu.addAction(clear_action)
+        menu.exec(self.view.viewport().mapToGlobal(position))
 
-    def _recompute_summary(self):
-        self._summary_pending = False
-        total = len(self._file_items)
-        sel = 0
-        size = 0
-        for it in self._file_items:
-            if it.checkState(0) == Qt.CheckState.Checked:
-                sel += 1
-                size += int(it.data(0, ROLE_SIZE) or 0)
-        self.bottom.set_summary(sel, size)
-
-        if total == 0 or sel == 0:
-            self._sel_all.set_state(False)
-        elif sel == total:
-            self._sel_all.set_state(True)
+    def _reveal(self, path: str) -> None:
+        if sys.platform == "win32":
+            QProcess.startDetached("explorer.exe", ["/select,", path])
         else:
-            self._sel_all.set_state("mixed")
+            QProcess.startDetached("xdg-open", [os.path.dirname(path)])
 
-        if total == 0:
-            self.status.set_text("Готово", "0 элементов")
+    def _refresh_summary(self) -> None:
+        roots = self.model.roots
+        has_items = bool(roots)
+        self.stack.setCurrentIndex(1 if has_items else 0)
+        files, checked_files, _size, checked_size = summary(roots)
+        if self._state != PACKING:
+            self.bottom.set_summary(checked_files, checked_size)
+        if checked_files == 0:
+            self.select_all_box.set_state(False)
+        elif checked_files == files:
+            self.select_all_box.set_state(True)
         else:
+            self.select_all_box.set_state(MIXED)
+        if self._state != IDLE or self._note:
+            return
+        if files:
             self.status.set_text(
-                f"Загружено {total} {plural_files(total)} · "
-                f"{sel} выбрано для архива",
-                self._last_target,
+                f"Загружено {files} {plural_files(files)} · "
+                f"{checked_files} выбрано",
+                self._target_name,
             )
+        else:
+            self.status.set_text("Готово", "0 элементов")
 
-    def _checked_items(self) -> list[ArchiveItem]:
-        out = []
-        for it in self._file_items:
-            if it.checkState(0) != Qt.CheckState.Checked:
-                continue
-            path = it.data(0, ROLE_PATH)
-            arc = it.data(0, ROLE_ARC) or os.path.basename(path)
-            size = int(it.data(0, ROLE_SIZE) or 0)
-            out.append(ArchiveItem(src=path, arcname=arc, size=size))
-        return out
+    def _set_note(self, text: str, timeout: int = 6000) -> None:
+        self._note = text
+        self.status.set_text(text, self._target_name)
+        self._note_timer.start(timeout)
 
-    def _pack(self):
-        items = self._checked_items()
+    def _clear_note(self) -> None:
+        self._note = ""
+        self._refresh_summary()
+
+    def _set_state(self, state: int) -> None:
+        self._state = state
+        busy = state != IDLE
+        self.toolbar.set_busy(busy)
+        self.status.set_busy(busy)
+        if state == PACKING:
+            self.bottom.start_progress()
+        else:
+            self.bottom.stop_progress()
+        if state == SCANNING:
+            self.bottom.cancel_button.show()
+            self.bottom.pack_button.hide()
+        elif state == IDLE:
+            self.bottom.cancel_button.hide()
+            self.bottom.pack_button.show()
+
+    def _start_pack(self) -> None:
+        if self._state != IDLE:
+            return
+        items = collect_items(self.model.roots)
         if not items:
             return
         base_name = self._suggested_name or "архив"
         init_dir = self._suggested_dir or os.path.expanduser("~")
-        init_path = os.path.join(init_dir, base_name + ".zip")
-        target, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить архив", init_path, "ZIP-архив (*.zip)"
+        target, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить архив",
+            os.path.join(init_dir, base_name + ".zip"),
+            "ZIP-архив (*.zip)",
         )
         if not target:
             return
         if not target.lower().endswith(".zip"):
             target += ".zip"
-        self._last_target = os.path.basename(target)
+        self._target_name = os.path.basename(target)
+        self._suggested_dir = os.path.dirname(target)
 
-        self.bottom.pack_btn.setEnabled(False)
-        self._worker = PackWorker(target, items)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.done.connect(lambda n: self._on_done(n, target))
-        self._worker.error.connect(self._on_error)
-        self._worker.start()
-
-    def _on_progress(self, done: int, total: int, name: str):
-        pct = int(done * 100 / total) if total else 0
-        self.status.set_text(
-            f"Упаковка… {pct}% · {name}", self._last_target
+        options = PackOptions(
+            level=self.toolbar.level(),
+            smart_store=self.toolbar.level() < 9,
+            workers=default_workers(),
         )
+        worker = PackWorker(target, items, options, self)
+        worker.progress.connect(self._on_pack_progress)
+        worker.packed.connect(self._on_packed)
+        worker.failed.connect(self._on_pack_failed)
+        worker.finished.connect(self._on_pack_finished)
+        self._packer = worker
+        self._pack_started = time.monotonic()
+        self._set_state(PACKING)
+        self.status.set_text("Упаковка…", self._target_name)
+        worker.start()
 
-    def _on_done(self, written: int, target: str):
-        self.bottom.pack_btn.setEnabled(True)
-        self.status.set_text(
-            f"Готово · записано {written} {plural_files(written)}",
-            os.path.basename(target),
-        )
-        QMessageBox.information(
-            self,
-            "Quick Zip",
-            f"Архив создан:\n{target}\n\n"
-            f"Записано файлов: {written}\n"
-            f"Размер архива: {human_size(os.path.getsize(target))}",
-        )
+    def _on_pack_progress(self, done: int, total: int, name: str) -> None:
+        elapsed = max(time.monotonic() - self._pack_started, 0.001)
+        speed = done / elapsed
+        remaining = (total - done) / speed if speed > 0 else 0.0
+        details = f"{human_size(done)} из {human_size(total)}"
+        if speed > 0:
+            details += (
+                f" · {human_speed(speed)} · осталось "
+                f"{human_duration(remaining)}"
+            )
+        self.bottom.set_progress(done, total, details)
+        if name:
+            self.status.set_text(f"Упаковка… {name}", self._target_name)
 
-    def _on_error(self, message: str):
-        self.bottom.pack_btn.setEnabled(True)
-        self._recompute_summary()
-        if message == "Упаковка отменена":
-            self.status.set_text("Упаковка отменена", self._last_target)
+    def _on_packed(self, result: PackResult) -> None:
+        if result.cancelled:
+            self._set_note("Упаковка отменена")
             return
-        QMessageBox.critical(
-            self, "Quick Zip", f"Не удалось создать архив:\n{message}"
+        target = self._packer.zip_path if self._packer else ""
+        saved = 1.0 - result.ratio
+        self._set_note(
+            f"Готово · {result.written} "
+            f"{plural_items(result.written)} за "
+            f"{human_duration(result.elapsed)}",
+            20000,
         )
+        if self._closing:
+            return
+        text = (
+            f"Архив создан:\n{target}\n\n"
+            f"Записано: {result.written} {plural_items(result.written)}\n"
+            f"Размер архива: {human_size(result.archive_size)} "
+            f"(экономия {saved * 100:.0f}%)\n"
+            f"Время: {human_duration(result.elapsed)} · "
+            f"{human_speed(result.total_size / max(result.elapsed, 0.001))}"
+        )
+        if result.skipped:
+            text += f"\nПропущено файлов: {result.skipped}"
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(text)
+        if result.warnings:
+            box.setDetailedText("\n".join(result.warnings[:50]))
+        reveal = box.addButton(
+            "Показать в проводнике", QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is reveal:
+            self._reveal(target)
 
-    def toggle_max_restore(self):
+    def _on_pack_failed(self, message: str) -> None:
+        self._set_note("Ошибка упаковки")
+        if not self._closing:
+            QMessageBox.critical(
+                self, APP_NAME, f"Не удалось создать архив:\n{message}"
+            )
+
+    def _on_pack_finished(self) -> None:
+        self._packer = None
+        self._set_state(IDLE)
+        self._refresh_summary()
+
+    def _cancel_current(self) -> None:
+        if self._state == SCANNING and self._scanner is not None:
+            self._scanner.cancel()
+        elif self._state == PACKING and self._packer is not None:
+            self._packer.cancel()
+            self.status.set_text("Отмена…", self._target_name)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls() and self._state != PACKING:
+            event.acceptProposedAction()
+            self.empty.set_highlighted(True)
+
+    def dragLeaveEvent(self, _event) -> None:
+        self.empty.set_highlighted(False)
+
+    def dropEvent(self, event) -> None:
+        self.empty.set_highlighted(False)
+        if self._state == PACKING:
+            return
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if local:
+                self.add_path(local)
+        event.acceptProposedAction()
+
+    def toggle_max_restore(self) -> None:
         if self.isMaximized():
             self.showNormal()
         else:
             self.showMaximized()
 
-    def _edges_at(self, pos):
+    def _start_move(self) -> None:
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.startSystemMove()
+
+    def _edges_at(self, position) -> Qt.Edge:
         if self.isMaximized():
             return Qt.Edge(0)
-        r = self.rect()
-        m = RESIZE_MARGIN + 2
+        rect = self.rect()
+        margin = RESIZE_MARGIN + 2
         edges = Qt.Edge(0)
-        if pos.x() <= m:
+        if position.x() <= margin:
             edges |= Qt.Edge.LeftEdge
-        if pos.x() >= r.width() - m:
+        if position.x() >= rect.width() - margin:
             edges |= Qt.Edge.RightEdge
-        if pos.y() <= m:
+        if position.y() <= margin:
             edges |= Qt.Edge.TopEdge
-        if pos.y() >= r.height() - m:
+        if position.y() >= rect.height() - margin:
             edges |= Qt.Edge.BottomEdge
         return edges
 
-    def _cursor_for(self, edges):
-        le = bool(edges & Qt.Edge.LeftEdge)
-        re = bool(edges & Qt.Edge.RightEdge)
-        te = bool(edges & Qt.Edge.TopEdge)
-        be = bool(edges & Qt.Edge.BottomEdge)
-        if (le and te) or (re and be):
+    @staticmethod
+    def _cursor_for(edges: Qt.Edge) -> Qt.CursorShape:
+        left = bool(edges & Qt.Edge.LeftEdge)
+        right = bool(edges & Qt.Edge.RightEdge)
+        top = bool(edges & Qt.Edge.TopEdge)
+        bottom = bool(edges & Qt.Edge.BottomEdge)
+        if (left and top) or (right and bottom):
             return Qt.CursorShape.SizeFDiagCursor
-        if (re and te) or (le and be):
+        if (right and top) or (left and bottom):
             return Qt.CursorShape.SizeBDiagCursor
-        if le or re:
+        if left or right:
             return Qt.CursorShape.SizeHorCursor
-        if te or be:
+        if top or bottom:
             return Qt.CursorShape.SizeVerCursor
         return Qt.CursorShape.ArrowCursor
 
-    def mouseMoveEvent(self, event):
-        edges = self._edges_at(event.position().toPoint())
-        self.setCursor(self._cursor_for(edges))
+    def mouseMoveEvent(self, event) -> None:
+        self.setCursor(self._cursor_for(self._edges_at(
+            event.position().toPoint()
+        )))
         super().mouseMoveEvent(event)
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             edges = self._edges_at(event.position().toPoint())
             if edges != Qt.Edge(0):
@@ -1123,25 +580,26 @@ class MainWindow(QWidget):
                     handle.startSystemResize(edges)
         super().mousePressEvent(event)
 
-
-def _dark_palette() -> QPalette:
-    pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window, QColor(C_WINDOW))
-    pal.setColor(QPalette.ColorRole.WindowText, QColor(C_TEXT))
-    pal.setColor(QPalette.ColorRole.Base, QColor(C_PANEL))
-    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(C_PANEL_ALT))
-    pal.setColor(QPalette.ColorRole.Text, QColor(C_TEXT))
-    pal.setColor(QPalette.ColorRole.Button, QColor(C_PANEL_ALT))
-    pal.setColor(QPalette.ColorRole.ButtonText, QColor(C_TEXT))
-    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(C_BAR))
-    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(C_TEXT))
-    pal.setColor(QPalette.ColorRole.Highlight, QColor(C_ACCENT))
-    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("white"))
-    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(C_TEXT_DIM))
-    return pal
+    def closeEvent(self, event) -> None:
+        self._closing = True
+        self._save_settings()
+        self._scan_queue.clear()
+        for worker in (self._scanner, self._packer):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                worker.wait(5000)
+        event.accept()
 
 
-def run() -> int:
+def _install_translator(application: QApplication) -> None:
+    translator = QTranslator(application)
+    path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+    if translator.load(QLocale.system(), "qtbase", "_", path):
+        application.installTranslator(translator)
+
+
+def run(argv: list[str] | None = None) -> int:
+    arguments = list(argv if argv is not None else sys.argv)
     if sys.platform == "win32":
         try:
             import ctypes
@@ -1152,13 +610,21 @@ def run() -> int:
         except Exception:
             pass
 
-    QApplication.setApplicationName("Quick Zip")
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setPalette(_dark_palette())
+    QApplication.setApplicationName(APP_NAME)
+    QApplication.setApplicationVersion(APP_VERSION)
+    QApplication.setOrganizationName("QuickZip")
+    application = QApplication(arguments)
+    application.setStyle("Fusion")
+    application.setPalette(dark_palette())
+    application.setStyleSheet(APP_QSS)
+    _install_translator(application)
     icon = app_icon()
-    app.setWindowIcon(icon)
-    win = MainWindow()
-    win.setWindowIcon(icon)
-    win.show()
-    return app.exec()
+    application.setWindowIcon(icon)
+
+    window = MainWindow()
+    window.setWindowIcon(icon)
+    window.show()
+    for path in arguments[1:]:
+        if not path.startswith("-"):
+            QTimer.singleShot(0, lambda item=path: window.add_path(item))
+    return application.exec()
