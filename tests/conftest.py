@@ -48,6 +48,21 @@ def sample_tree(tmp_path):
     return root
 
 
+@pytest.fixture(autouse=True, scope="session")
+def isolated_settings(tmp_path_factory):
+    from PyQt6.QtCore import QSettings
+
+    import ui.main_window as main_window
+
+    path = str(tmp_path_factory.mktemp("settings") / "quickzip.ini")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            main_window, "QSettings",
+            lambda *args: QSettings(path, QSettings.Format.IniFormat),
+        )
+        yield path
+
+
 @pytest.fixture(scope="session")
 def qt_app():
     from PyQt6.QtWidgets import QApplication

@@ -41,27 +41,6 @@ QPushButton:pressed {{ background: #2f2f2f; }}
 QPushButton:disabled {{ color: {C_TEXT_FAINT}; border-color: #2b2b2b; }}
 """
 
-COMBO_QSS = f"""
-QComboBox {{
-    background: {C_PANEL_ALT};
-    border: 1px solid {C_BORDER};
-    border-radius: 4px;
-    padding: 6px 10px;
-    color: {C_TEXT};
-    font-size: 13px;
-    min-width: 128px;
-}}
-QComboBox:hover {{ background: {C_HOVER}; }}
-QComboBox::drop-down {{ border: none; width: 18px; }}
-QComboBox QAbstractItemView {{
-    background: {C_PANEL};
-    border: 1px solid {C_BORDER};
-    color: {C_TEXT};
-    selection-background-color: {C_ACCENT};
-    outline: none;
-}}
-"""
-
 PRIMARY_BUTTON_QSS = f"""
 QPushButton {{
     background: {C_ACCENT};

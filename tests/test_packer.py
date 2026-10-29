@@ -57,6 +57,29 @@ def test_crc32_combine_zero_length():
     assert crc32_combine(0x1234, 0, 0) == 0x1234
 
 
+@pytest.mark.parametrize("length", [1, 2, 7, 64, 4095, 65537, 4 << 20])
+def test_crc32_combine_matches_zlib_on_many_lengths(length):
+    left = random_blob(1000, length)
+    right = random_blob(length, length + 1)
+    combined = crc32_combine(zlib.crc32(left), zlib.crc32(right), len(right))
+    assert combined == zlib.crc32(left + right)
+
+
+def test_pack_logs_summary_and_skipped_files(tmp_path, caplog):
+    write_file(str(tmp_path / "src" / "ok.txt"), text_blob(5000))
+    items = items_from(tmp_path / "src", ["ok.txt"])
+    items.append(ArchiveItem(str(tmp_path / "src" / "gone.txt"), "gone.txt",
+                             10, 0.0))
+    target = str(tmp_path / "log.zip")
+    with caplog.at_level("INFO", logger="quickzip.packer"):
+        result = create_zip(target, items, PackOptions(workers=2))
+    assert result.skipped == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Skipped unreadable file" in text and "gone.txt" in text
+               for text in messages)
+    assert any(text.startswith("Archive written") for text in messages)
+
+
 def test_roundtrip_small_files(tmp_path):
     payloads = {
         "docs/readme.md": text_blob(3000),

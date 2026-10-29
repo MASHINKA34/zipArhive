@@ -95,6 +95,44 @@ def test_model_check_toggle(sample_tree):
     assert model.roots[0].checked_units == model.roots[0].units
 
 
+def test_model_check_toggle_notifies_only_path(tmp_path):
+    for top in range(5):
+        for sub in range(5):
+            write_file(str(tmp_path / "root" / f"d{top}" / f"s{sub}" /
+                           "f.txt"), b"x")
+    model = build_model(tmp_path / "root")
+    root_index = model.index(0, 0, QModelIndex())
+    folder = find_row(model, root_index, "d0")
+    changes = []
+    model.dataChanged.connect(lambda *args: changes.append(args[0]))
+
+    model.setData(folder, Qt.CheckState.Unchecked.value,
+                  Qt.ItemDataRole.CheckStateRole)
+
+    assert len(changes) == 2
+    assert {model.data(index) for index in changes} == {"d0", "root"}
+    leaf_dir = find_row(model, folder, "s3")
+    leaf = model.index(0, 0, leaf_dir)
+    assert model.data(leaf, Qt.ItemDataRole.CheckStateRole) == (
+        Qt.CheckState.Unchecked
+    )
+    assert model.data(root_index, Qt.ItemDataRole.CheckStateRole) == (
+        Qt.CheckState.PartiallyChecked
+    )
+
+
+def test_model_index_bounds(sample_tree):
+    model = build_model(sample_tree)
+    root_index = model.index(0, 0, QModelIndex())
+    assert not model.index(1, 0, QModelIndex()).isValid()
+    assert not model.index(0, 3, QModelIndex()).isValid()
+    assert not model.index(-1, 0, QModelIndex()).isValid()
+    assert not model.index(0, 0, root_index.siblingAtColumn(1)).isValid()
+    readme = find_row(model, root_index, "readme.md")
+    assert not model.index(0, 0, readme).isValid()
+    assert model.rowCount(root_index.siblingAtColumn(2)) == 0
+
+
 def test_model_flags_and_headers(sample_tree):
     model = build_model(sample_tree)
     index = model.index(0, 0, QModelIndex())
@@ -326,3 +364,192 @@ def test_window_close_while_scanning(qt_app, sample_tree):
     window.close()
     assert pump(qt_app, lambda: window._scanner is None
                 or not window._scanner.isRunning())
+
+
+def _check_fill_on_screen(window, index) -> str:
+    from PyQt6.QtWidgets import QStyle, QStyleOptionViewItem
+
+    view = window.view
+    option = QStyleOptionViewItem()
+    view.initViewItemOption(option)
+    option.rect = view.visualRect(index)
+    option.features |= QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+    box = view.style().subElementRect(
+        QStyle.SubElement.SE_ItemViewItemCheckIndicator, option, view
+    )
+    origin = view.viewport().mapTo(window, box.topLeft())
+    image = window.screen().grabWindow(window.winId()).toImage()
+    ratio = image.devicePixelRatio()
+    x = origin.x() + 3
+    y = origin.y() + box.height() // 2
+    return image.pixelColor(int(x * ratio), int(y * ratio)).name()
+
+
+def test_unchecking_folder_repaints_visible_descendants(qt_app, sample_tree):
+    window = MainWindow()
+    window.resize(1000, 700)
+    window.show()
+    window.add_path(str(sample_tree))
+    assert pump(qt_app, lambda: window._state == IDLE
+                and not window.model.is_empty())
+    model = window.model
+    root_index = model.index(0, 0, QModelIndex())
+    source = find_row(model, root_index, "src")
+    window.view.expand(source)
+    main = find_row(model, source, "main.py")
+    pump(qt_app, lambda: False, timeout=0.3)
+    checked_color = _check_fill_on_screen(window, main)
+
+    model.setData(root_index, Qt.CheckState.Unchecked.value,
+                  Qt.ItemDataRole.CheckStateRole)
+    pump(qt_app, lambda: False, timeout=0.3)
+    unchecked_color = _check_fill_on_screen(window, main)
+    assert unchecked_color != checked_color
+
+    model.setData(source, Qt.CheckState.Checked.value,
+                  Qt.ItemDataRole.CheckStateRole)
+    pump(qt_app, lambda: False, timeout=0.3)
+    assert _check_fill_on_screen(window, main) == checked_color
+    window.close()
+
+
+def test_toolbar_has_no_compression_choice(qt_app):
+    from PyQt6.QtWidgets import QComboBox
+
+    window = MainWindow()
+    assert not window.toolbar.findChildren(QComboBox)
+    assert not hasattr(window.toolbar, "level_box")
+    window.close()
+
+
+def test_window_pack_reveals_normalized_path(qt_app, sample_tree, tmp_path,
+                                             monkeypatch):
+    from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+    import ui.main_window as main_window
+
+    dialog_target = str(tmp_path / "показ.zip").replace("\\", "/")
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        staticmethod(lambda *args, **kwargs: (dialog_target, "")),
+    )
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+    monkeypatch.setattr(
+        QMessageBox, "clickedButton",
+        lambda self: next(button for button in self.buttons()
+                          if button.text() == "Показать в проводнике"),
+    )
+    revealed = []
+    monkeypatch.setattr(main_window, "reveal_in_explorer",
+                        lambda path: revealed.append(path) or True)
+
+    window = MainWindow()
+    window.add_path(str(sample_tree))
+    assert pump(qt_app, lambda: window._state == IDLE
+                and not window.model.is_empty())
+    window._start_pack()
+    assert pump(qt_app, lambda: window._state == IDLE and revealed)
+    assert revealed == [os.path.normpath(dialog_target)]
+    assert os.path.exists(revealed[0])
+    window.close()
+
+
+def test_expand_all_respects_row_limit(qt_app, tmp_path, monkeypatch):
+    import ui.main_window as main_window
+
+    for index in range(30):
+        write_file(str(tmp_path / "root" / "big" / f"f{index}.txt"), b"x")
+    for index in range(3):
+        write_file(str(tmp_path / "root" / "small" / "inner" /
+                       f"f{index}.txt"), b"x")
+    monkeypatch.setattr(main_window, "EXPAND_ROW_LIMIT", 12)
+    window = MainWindow()
+    window.add_path(str(tmp_path / "root"))
+    assert pump(qt_app, lambda: window._state == IDLE
+                and not window.model.is_empty())
+    model = window.model
+    root_index = model.index(0, 0, QModelIndex())
+    big = find_row(model, root_index, "big")
+    small = find_row(model, root_index, "small")
+    inner = find_row(model, small, "inner")
+
+    window._expand_all()
+
+    assert window.view.isExpanded(root_index)
+    assert window.view.isExpanded(small)
+    assert window.view.isExpanded(inner)
+    assert not window.view.isExpanded(big)
+    assert "Развёрнуто частично" in window.status.left.text()
+    window.close()
+
+
+def test_expand_all_small_tree_expands_everything(qt_app, sample_tree):
+    window = MainWindow()
+    window.add_path(str(sample_tree))
+    assert pump(qt_app, lambda: window._state == IDLE
+                and not window.model.is_empty())
+    window._expand_all()
+    model = window.model
+    root_index = model.index(0, 0, QModelIndex())
+    source = find_row(model, root_index, "src")
+    utils = find_row(model, source, "utils")
+    assert window.view.isExpanded(source)
+    assert window.view.isExpanded(utils)
+    assert "частично" not in window.status.left.text()
+    window.close()
+
+
+def test_reveal_normalizes_path(tmp_path, monkeypatch):
+    from ui import shell
+
+    target = write_file(str(tmp_path / "a b" / "архив.zip"), b"zip")
+    selected = []
+    monkeypatch.setattr(shell.sys, "platform", "win32")
+    monkeypatch.setattr(shell, "_shell_select", selected.append)
+    assert shell.reveal_in_explorer(target.replace("\\", "/"))
+    assert selected == [os.path.normpath(target)]
+
+
+def test_reveal_falls_back_to_explorer_select(tmp_path, monkeypatch):
+    from ui import shell
+
+    target = write_file(str(tmp_path / "a b" / "архив.zip"), b"zip")
+    commands = []
+
+    def failing_select(path):
+        raise OSError("HRESULT 0x80004005")
+
+    monkeypatch.setattr(shell.sys, "platform", "win32")
+    monkeypatch.setattr(shell, "_shell_select", failing_select)
+    monkeypatch.setattr(shell.subprocess, "Popen", commands.append)
+    assert shell.reveal_in_explorer(target)
+    expected = 'explorer.exe /select,"' + os.path.normpath(target) + '"'
+    assert commands == [expected]
+
+
+def test_reveal_missing_file_opens_folder(tmp_path, monkeypatch):
+    from ui import shell
+
+    opened = []
+    monkeypatch.setattr(shell, "_open_folder",
+                        lambda folder: opened.append(folder) or True)
+    assert shell.reveal_in_explorer(str(tmp_path / "нет.zip"))
+    assert opened == [os.path.normpath(str(tmp_path))]
+
+
+def test_watchdog_reports_stall_and_recovery(qt_app, caplog):
+    from ui.watchdog import StallWatchdog
+
+    watchdog = StallWatchdog(threshold=0.3, beat_ms=50)
+    with caplog.at_level("INFO", logger="quickzip.watchdog"):
+        watchdog.start()
+        pump(qt_app, lambda: False, timeout=0.2)
+        time.sleep(0.9)
+        pump(qt_app, lambda: any("responsive again" in r.getMessage()
+                                 for r in caplog.records), timeout=2)
+        watchdog.stop()
+    messages = [record.getMessage() for record in caplog.records]
+    stalls = [text for text in messages if "not responding" in text]
+    assert len(stalls) == 1
+    assert "test_watchdog_reports_stall_and_recovery" in stalls[0]
+    assert any("responsive again" in text for text in messages)

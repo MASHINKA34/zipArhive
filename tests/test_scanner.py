@@ -74,6 +74,17 @@ def test_scan_missing_directory_returns_empty_root(tmp_path):
     assert root.children == []
 
 
+def test_scan_logs_unreadable_directory_and_summary(tmp_path, caplog):
+    missing = tmp_path / "нет_такой"
+    with caplog.at_level("INFO", logger="quickzip.scanner"):
+        scan_tree(str(missing))
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Cannot list directory" in text and "нет_такой" in text
+               for text in messages)
+    assert any(text.startswith("Scanned ") and "1 unreadable" in text
+               for text in messages)
+
+
 def test_scan_file(tmp_path):
     path = write_file(str(tmp_path / "one.txt"), b"12345")
     node = scan_file(path)

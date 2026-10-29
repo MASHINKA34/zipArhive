@@ -3,7 +3,6 @@ from __future__ import annotations
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PyQt6.QtWidgets import (
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -17,7 +16,6 @@ from core.formatting import human_size, plural_files
 from ui.icons import app_icon, svg_icon, svg_pixmap
 from ui.theme import (
     CANCEL_BUTTON_QSS,
-    COMBO_QSS,
     C_ACCENT,
     C_ACCENT_HI,
     C_AMBER,
@@ -230,7 +228,6 @@ class Toolbar(QWidget):
     add_folder_requested = pyqtSignal()
     add_files_requested = pyqtSignal()
     clear_requested = pyqtSignal()
-    level_changed = pyqtSignal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -261,34 +258,9 @@ class Toolbar(QWidget):
         layout.addWidget(self.clear_button)
         layout.addStretch(1)
 
-        label = QLabel("Сжатие")
-        label.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 12px;")
-        layout.addWidget(label)
-
-        self.level_box = QComboBox()
-        self.level_box.setStyleSheet(COMBO_QSS)
-        self.level_box.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.level_box.addItem("Быстрое", 1)
-        self.level_box.addItem("Обычное", 6)
-        self.level_box.addItem("Максимальное", 9)
-        self.level_box.setCurrentIndex(1)
-        self.level_box.currentIndexChanged.connect(
-            lambda _index: self.level_changed.emit(self.level())
-        )
-        layout.addWidget(self.level_box)
-
-    def level(self) -> int:
-        return int(self.level_box.currentData())
-
-    def set_level(self, level: int) -> None:
-        index = self.level_box.findData(level)
-        if index >= 0:
-            self.level_box.setCurrentIndex(index)
-
     def set_busy(self, busy: bool) -> None:
         for widget in (
-            self.add_folder_button, self.add_files_button,
-            self.clear_button, self.level_box,
+            self.add_folder_button, self.add_files_button, self.clear_button,
         ):
             widget.setEnabled(not busy)
 
@@ -297,8 +269,8 @@ class BottomPanel(QWidget):
     pack_requested = pyqtSignal()
     cancel_requested = pyqtSignal()
 
-    SPEED_BY_LEVEL = {1: 340.0, 6: 230.0, 9: 85.0}
-    RATIO_BY_LEVEL = {1: 0.72, 6: 0.62, 9: 0.58}
+    ESTIMATE_SPEED = 230.0 * (1 << 20)
+    ESTIMATE_RATIO = 0.62
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -307,7 +279,7 @@ class BottomPanel(QWidget):
             f"#bottom {{ background: {C_PANEL}; "
             f"border-top: 1px solid {C_BORDER}; }}"
         )
-        self._level = 6
+        self._pack_style_enabled: bool | None = None
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 12, 18, 12)
         layout.setSpacing(16)
@@ -344,15 +316,14 @@ class BottomPanel(QWidget):
         layout.addWidget(self.pack_button)
         self.set_summary(0, 0)
 
-    def set_level(self, level: int) -> None:
-        self._level = level
-
     def set_summary(self, count: int, total_bytes: int) -> None:
         enabled = count > 0
         self.pack_button.setEnabled(enabled)
-        self.pack_button.setStyleSheet(
-            PRIMARY_BUTTON_QSS if enabled else MUTED_BUTTON_QSS
-        )
+        if enabled != self._pack_style_enabled:
+            self._pack_style_enabled = enabled
+            self.pack_button.setStyleSheet(
+                PRIMARY_BUTTON_QSS if enabled else MUTED_BUTTON_QSS
+            )
         if not enabled:
             self.summary.setText(
                 f'<span style="color:{C_TEXT_DIM};">Выбрано: </span><b>0</b>'
@@ -366,11 +337,10 @@ class BottomPanel(QWidget):
             f'<span style="color:{C_TEXT_DIM};"> {plural_files(count)} '
             f"({human_size(total_bytes)})</span>"
         )
-        ratio = self.RATIO_BY_LEVEL.get(self._level, 0.62)
-        speed = self.SPEED_BY_LEVEL.get(self._level, 230.0) * (1 << 20)
-        seconds = max(1, round(total_bytes / speed))
+        seconds = max(1, round(total_bytes / self.ESTIMATE_SPEED))
         self.estimate.setText(
-            f"≈ {human_size(int(total_bytes * ratio))} после сжатия · "
+            f"≈ {human_size(int(total_bytes * self.ESTIMATE_RATIO))} "
+            "после сжатия · "
             f"~{seconds} с"
         )
 

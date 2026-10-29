@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from typing import Callable, Iterable
 
 from core.formatting import natural_key
@@ -13,12 +15,14 @@ CHECKED = 2
 
 PROGRESS_STEP = 4096
 
+log = logging.getLogger("quickzip.scanner")
+
 
 class Node:
     __slots__ = (
         "name", "parent", "row", "children", "root_path",
         "size", "mtime", "units", "checked_units",
-        "files", "checked_files", "checked_size", "expanded",
+        "files", "checked_files", "checked_size",
     )
 
     def __init__(self, name: str, parent: "Node | None", row: int) -> None:
@@ -34,7 +38,6 @@ class Node:
         self.files = 0
         self.checked_files = 0
         self.checked_size = 0
-        self.expanded = False
 
     @property
     def is_dir(self) -> bool:
@@ -70,7 +73,9 @@ def scan_tree(
     on_progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Node:
+    started = time.perf_counter()
     root_path = os.path.abspath(root_path)
+    log.debug("Scanning tree %s", root_path)
     root = Node(os.path.basename(root_path) or root_path, None, 0)
     root.root_path = root_path
     root.children = []
@@ -79,17 +84,25 @@ def scan_tree(
     index = 0
     seen_files = 0
     seen_bytes = 0
+    unreadable = 0
     next_report = PROGRESS_STEP
+    debug = log.isEnabledFor(logging.DEBUG)
 
     while index < len(queue):
         node, current = queue[index]
         index += 1
         if should_cancel is not None and should_cancel():
+            log.info(
+                "Scan of %s cancelled after %d files in %.0f ms",
+                root_path, seen_files, (time.perf_counter() - started) * 1000,
+            )
             raise ScanCancelled
         try:
             with os.scandir(long_path(current)) as iterator:
                 entries = list(iterator)
-        except OSError:
+        except OSError as exc:
+            unreadable += 1
+            log.warning("Cannot list directory %s: %s", current, exc)
             continue
         dir_entries: list[os.DirEntry] = []
         file_entries: list[tuple[str, int, float]] = []
@@ -101,7 +114,9 @@ def scan_tree(
                     stat = entry.stat(follow_symlinks=False)
                     file_entries.append((entry.name, stat.st_size,
                                          stat.st_mtime))
-            except OSError:
+            except OSError as exc:
+                unreadable += 1
+                log.warning("Cannot stat %s: %s", entry.path, exc)
                 continue
         dir_entries.sort(key=lambda item: natural_key(item.name))
         file_entries.sort(key=lambda item: natural_key(item[0]))
@@ -124,6 +139,9 @@ def scan_tree(
             seen_files += 1
             seen_bytes += size
         node.children = children
+        if debug:
+            log.debug("Listed %s: %d dirs, %d files", current,
+                      len(dir_entries), len(file_entries))
 
         if on_progress is not None and seen_files >= next_report:
             next_report = seen_files + PROGRESS_STEP
@@ -150,6 +168,11 @@ def scan_tree(
 
     if on_progress is not None:
         on_progress(seen_files, seen_bytes)
+    log.info(
+        "Scanned %s: %d dirs, %d files, %d bytes, %d unreadable in %.0f ms",
+        root_path, len(directories), seen_files, seen_bytes, unreadable,
+        (time.perf_counter() - started) * 1000,
+    )
     return root
 
 
@@ -157,7 +180,8 @@ def scan_file(path: str) -> Node | None:
     path = os.path.abspath(path)
     try:
         stat = os.stat(long_path(path))
-    except OSError:
+    except OSError as exc:
+        log.warning("Cannot stat file %s: %s", path, exc)
         return None
     node = Node(os.path.basename(path) or path, None, 0)
     node.root_path = path

@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import itertools
+import logging
 import os
+import platform
 import sys
 import time
 from collections import deque
 
 from PyQt6.QtCore import (
+    PYQT_VERSION_STR,
     QLibraryInfo,
     QLocale,
     QPoint,
-    QProcess,
     QSettings,
     QSize,
     Qt,
+    QtMsgType,
     QTimer,
     QTranslator,
+    qInstallMessageHandler,
+    qVersion,
 )
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
@@ -34,15 +40,19 @@ from core.formatting import (
     human_duration,
     human_size,
     human_speed,
+    plural,
     plural_files,
     plural_items,
 )
+from core.logsetup import job_context, setup_logging
 from core.packer import PackOptions, PackResult, default_workers
 from core.scanner import Node, collect_items, summary
 from ui.file_model import FileTreeModel
 from ui.icons import app_icon
+from ui.shell import reveal_in_explorer
 from ui.style import TreeStyle
 from ui.theme import APP_QSS, C_WINDOW, MENU_QSS, TREE_QSS, dark_palette
+from ui.watchdog import StallWatchdog
 from ui.widgets import (
     MIXED,
     BottomPanel,
@@ -55,9 +65,14 @@ from ui.widgets import (
 from ui.workers import PackWorker, ScanWorker
 
 APP_NAME = "Quick Zip"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 RESIZE_MARGIN = 5
+EXPAND_ROW_LIMIT = 5000
+STALL_THRESHOLD = 3.0
 IDLE, SCANNING, PACKING = 0, 1, 2
+_STATE_NAMES = {IDLE: "idle", SCANNING: "scanning", PACKING: "packing"}
+
+log = logging.getLogger("quickzip.ui")
 
 
 class MainWindow(QWidget):
@@ -77,6 +92,7 @@ class MainWindow(QWidget):
         self._scan_queue: deque[tuple[str, bool]] = deque()
         self._scanner: ScanWorker | None = None
         self._packer: PackWorker | None = None
+        self._jobs = itertools.count(1)
         self._suggested_name = ""
         self._suggested_dir = ""
         self._target_name = "архив.zip"
@@ -89,6 +105,7 @@ class MainWindow(QWidget):
 
         self.model = FileTreeModel(self)
         self.model.selection_changed.connect(self._refresh_summary)
+        self.model.subtree_checked.connect(self._repaint_subtree)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(
@@ -107,7 +124,6 @@ class MainWindow(QWidget):
         self.toolbar.add_folder_requested.connect(self._choose_folder)
         self.toolbar.add_files_requested.connect(self._choose_files)
         self.toolbar.clear_requested.connect(self._clear_all)
-        self.toolbar.level_changed.connect(self._on_level_changed)
         layout.addWidget(self.toolbar)
 
         self.stack = QStackedWidget()
@@ -153,12 +169,6 @@ class MainWindow(QWidget):
         view.setSortingEnabled(False)
         view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         view.customContextMenuRequested.connect(self._show_context_menu)
-        view.expanded.connect(
-            lambda index: self.model.set_expanded(index, True)
-        )
-        view.collapsed.connect(
-            lambda index: self.model.set_expanded(index, False)
-        )
 
         header = view.header()
         header.setFixedHeight(38)
@@ -173,7 +183,7 @@ class MainWindow(QWidget):
 
         self.select_all_box = TriCheckBox(header)
         self.select_all_box.setGeometry(15, 9, 20, 20)
-        self.select_all_box.toggled.connect(self.model.set_all_checked)
+        self.select_all_box.toggled.connect(self._on_select_all_toggled)
         self.select_all_box.raise_()
         return view
 
@@ -183,8 +193,8 @@ class MainWindow(QWidget):
             ("Ctrl+Shift+O", self._choose_files),
             ("Ctrl+Shift+Delete", self._clear_all),
             ("Ctrl+Return", self._start_pack),
-            ("Ctrl+A", lambda: self.model.set_all_checked(True)),
-            ("Ctrl+D", lambda: self.model.set_all_checked(False)),
+            ("Ctrl+A", lambda: self._on_select_all_toggled(True)),
+            ("Ctrl+D", lambda: self._on_select_all_toggled(False)),
             ("Delete", self._remove_selected),
             ("F5", self._rescan_roots),
             ("Escape", self._cancel_current),
@@ -198,46 +208,63 @@ class MainWindow(QWidget):
         geometry = self._settings.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
-        level = self._settings.value("pack/level", 6, type=int)
-        self.toolbar.set_level(level)
-        self.bottom.set_level(self.toolbar.level())
         self._suggested_dir = self._settings.value("pack/last_dir", "",
                                                    type=str)
+        log.info(
+            "Settings restored from %s: geometry=%s last_dir=%r",
+            self._settings.fileName(), geometry is not None,
+            self._suggested_dir,
+        )
 
     def _save_settings(self) -> None:
         self._settings.setValue("window/geometry", self.saveGeometry())
-        self._settings.setValue("pack/level", self.toolbar.level())
         self._settings.setValue("pack/last_dir", self._suggested_dir)
-
-    def _on_level_changed(self, level: int) -> None:
-        self.bottom.set_level(level)
-        self._refresh_summary()
+        self._settings.remove("pack/level")
+        self._settings.sync()
+        log.info("Settings saved: last_dir=%r status=%s",
+                 self._suggested_dir, self._settings.status().name)
 
     def add_path(self, path: str) -> None:
         path = os.path.normpath(path)
         if os.path.isdir(path):
             self._scan_queue.append((path, False))
+            kind = "folder"
         elif os.path.isfile(path):
             self._scan_queue.append((path, True))
+            kind = "file"
         else:
+            log.warning("Ignored path that is neither a file nor a folder: "
+                        "%s", path)
             return
+        log.info("Queued %s for scan: %s (queue=%d)", kind, path,
+                 len(self._scan_queue))
         self._start_next_scan()
 
     def _choose_folder(self) -> None:
         if self._state != IDLE:
+            log.debug("Add folder ignored: state=%s",
+                      _STATE_NAMES[self._state])
             return
         folder = QFileDialog.getExistingDirectory(
             self, "Выберите папку", self._suggested_dir
         )
-        if folder:
-            self.add_path(folder)
+        if not folder:
+            log.info("Folder dialog cancelled")
+            return
+        self.add_path(folder)
 
     def _choose_files(self) -> None:
         if self._state != IDLE:
+            log.debug("Add files ignored: state=%s",
+                      _STATE_NAMES[self._state])
             return
         paths, _filter = QFileDialog.getOpenFileNames(
             self, "Выберите файлы", self._suggested_dir
         )
+        if not paths:
+            log.info("Files dialog cancelled")
+            return
+        log.info("Files chosen in dialog: %d", len(paths))
         for path in paths:
             self.add_path(path)
 
@@ -245,7 +272,8 @@ class MainWindow(QWidget):
         if self._scanner is not None or not self._scan_queue:
             return
         path, as_file = self._scan_queue.popleft()
-        worker = ScanWorker(path, as_file, self)
+        job_id = f"scan-{next(self._jobs)}"
+        worker = ScanWorker(path, as_file, self, job_id=job_id)
         worker.scanned.connect(self._on_scanned)
         worker.progress.connect(self.bottom.set_scanning)
         worker.failed.connect(self._on_scan_failed)
@@ -257,8 +285,11 @@ class MainWindow(QWidget):
         worker.start()
 
     def _on_scanned(self, node: Node) -> None:
+        started = time.perf_counter()
         existing = self.model.find_root(node.root_path)
         if existing >= 0:
+            log.info("Replacing root already in the list: %s",
+                     node.root_path)
             self.model.remove_root(existing)
         index = self.model.add_root(node)
         if node.is_dir:
@@ -269,13 +300,20 @@ class MainWindow(QWidget):
             self._suggested_dir = os.path.dirname(node.root_path)
         if not self._suggested_name:
             self._suggested_name = node.name or "архив"
+        log.info(
+            "Added to list: %s (%d files, %s) in %.0f ms; roots=%d",
+            node.root_path, node.files, human_size(node.size),
+            (time.perf_counter() - started) * 1000, len(self.model.roots),
+        )
         self._set_note(f"Добавлено: «{node.name}»")
 
     def _on_scan_failed(self, message: str) -> None:
         self._set_note(f"Ошибка чтения: {message}")
 
     def _on_scan_cancelled(self) -> None:
+        dropped = len(self._scan_queue)
         self._scan_queue.clear()
+        log.info("Scan cancelled; dropped %d queued paths", dropped)
         self._set_note("Сканирование отменено")
 
     def _on_scan_finished(self) -> None:
@@ -292,6 +330,7 @@ class MainWindow(QWidget):
         paths = [
             (node.root_path, not node.is_dir) for node in self.model.roots
         ]
+        log.info("Rescanning %d roots", len(paths))
         self.model.clear()
         self._scan_queue.extend(paths)
         self._start_next_scan()
@@ -299,6 +338,7 @@ class MainWindow(QWidget):
     def _clear_all(self) -> None:
         if self._state != IDLE:
             return
+        log.info("List cleared (%d roots)", len(self.model.roots))
         self.model.clear()
         self._suggested_name = ""
         self._refresh_summary()
@@ -313,7 +353,9 @@ class MainWindow(QWidget):
         ]
         if not indexes:
             return
-        self.model.remove_indexes(indexes)
+        removed = self.model.remove_indexes(indexes)
+        log.info("Removed %d items from the list (%d rows selected)",
+                 removed, len(indexes))
         self._refresh_summary()
 
     def _show_context_menu(self, position: QPoint) -> None:
@@ -323,29 +365,88 @@ class MainWindow(QWidget):
         if index.isValid():
             node = self.model.node_at(index)
             open_action = QAction("Показать в проводнике", menu)
-            open_action.triggered.connect(lambda: self._reveal(node.path))
+            open_action.triggered.connect(
+                lambda: reveal_in_explorer(node.path)
+            )
             menu.addAction(open_action)
             remove_action = QAction("Убрать из списка", menu)
             remove_action.triggered.connect(self._remove_selected)
             menu.addAction(remove_action)
             menu.addSeparator()
         expand_action = QAction("Развернуть всё", menu)
-        expand_action.triggered.connect(self.view.expandAll)
+        expand_action.triggered.connect(self._expand_all)
         menu.addAction(expand_action)
         collapse_action = QAction("Свернуть всё", menu)
-        collapse_action.triggered.connect(self.view.collapseAll)
+        collapse_action.triggered.connect(self._collapse_all)
         menu.addAction(collapse_action)
         menu.addSeparator()
         clear_action = QAction("Очистить всё", menu)
         clear_action.triggered.connect(self._clear_all)
         menu.addAction(clear_action)
         menu.exec(self.view.viewport().mapToGlobal(position))
+        menu.deleteLater()
 
-    def _reveal(self, path: str) -> None:
-        if sys.platform == "win32":
-            QProcess.startDetached("explorer.exe", ["/select,", path])
-        else:
-            QProcess.startDetached("xdg-open", [os.path.dirname(path)])
+    def _expand_all(self) -> None:
+        started = time.perf_counter()
+        view = self.view
+        model = self.model
+        queue: deque[Node] = deque(model.roots)
+        visible = len(queue)
+        to_expand: list[Node] = []
+        skipped = 0
+        while queue:
+            node = queue.popleft()
+            children = node.children
+            if not children:
+                continue
+            if not view.isExpanded(model.index_for(node)):
+                if visible + len(children) > EXPAND_ROW_LIMIT:
+                    skipped += 1
+                    continue
+                to_expand.append(node)
+            visible += len(children)
+            queue.extend(children)
+        view.setUpdatesEnabled(False)
+        try:
+            for node in to_expand:
+                view.expand(model.index_for(node))
+        finally:
+            view.setUpdatesEnabled(True)
+        log.info(
+            "Expand all: expanded %d folders, ~%d visible rows, %d folders "
+            "left collapsed (limit %d rows) in %.0f ms",
+            len(to_expand), visible, skipped, EXPAND_ROW_LIMIT,
+            (time.perf_counter() - started) * 1000,
+        )
+        if skipped:
+            self._set_note(
+                f"Развёрнуто частично: {skipped} "
+                f"{plural(skipped, 'папка', 'папки', 'папок')} с большим "
+                "числом файлов оставлены свёрнутыми"
+            )
+
+    def _collapse_all(self) -> None:
+        started = time.perf_counter()
+        self.view.collapseAll()
+        log.info("Collapse all in %.0f ms",
+                 (time.perf_counter() - started) * 1000)
+
+    def _on_select_all_toggled(self, checked: bool) -> None:
+        started = time.perf_counter()
+        self.model.set_all_checked(checked)
+        log.info("Select all: checked=%s in %.0f ms", checked,
+                 (time.perf_counter() - started) * 1000)
+
+    def _repaint_subtree(self, index) -> None:
+        view = self.view
+        if not view.isExpanded(index):
+            return
+        rect = view.visualRect(index)
+        viewport = view.viewport()
+        if rect.isEmpty() or rect.top() >= viewport.height():
+            return
+        top = max(0, rect.top())
+        viewport.update(0, top, viewport.width(), viewport.height() - top)
 
     def _refresh_summary(self) -> None:
         roots = self.model.roots
@@ -381,6 +482,9 @@ class MainWindow(QWidget):
         self._refresh_summary()
 
     def _set_state(self, state: int) -> None:
+        if state != self._state:
+            log.debug("State %s -> %s", _STATE_NAMES[self._state],
+                      _STATE_NAMES[state])
         self._state = state
         busy = state != IDLE
         self.toolbar.set_busy(busy)
@@ -398,9 +502,11 @@ class MainWindow(QWidget):
 
     def _start_pack(self) -> None:
         if self._state != IDLE:
+            log.debug("Pack ignored: state=%s", _STATE_NAMES[self._state])
             return
         items = collect_items(self.model.roots)
         if not items:
+            log.info("Pack ignored: nothing is checked")
             return
         base_name = self._suggested_name or "архив"
         init_dir = self._suggested_dir or os.path.expanduser("~")
@@ -411,24 +517,25 @@ class MainWindow(QWidget):
             "ZIP-архив (*.zip)",
         )
         if not target:
+            log.info("Save dialog cancelled")
             return
+        target = os.path.normpath(target)
         if not target.lower().endswith(".zip"):
             target += ".zip"
         self._target_name = os.path.basename(target)
         self._suggested_dir = os.path.dirname(target)
 
-        options = PackOptions(
-            level=self.toolbar.level(),
-            smart_store=self.toolbar.level() < 9,
-            workers=default_workers(),
-        )
-        worker = PackWorker(target, items, options, self)
+        job_id = f"pack-{next(self._jobs)}"
+        options = PackOptions(workers=default_workers())
+        worker = PackWorker(target, items, options, self, job_id=job_id)
         worker.progress.connect(self._on_pack_progress)
         worker.packed.connect(self._on_packed)
         worker.failed.connect(self._on_pack_failed)
         worker.finished.connect(self._on_pack_finished)
         self._packer = worker
         self._pack_started = time.monotonic()
+        with job_context(job_id):
+            log.info("Pack requested: %d items -> %s", len(items), target)
         self._set_state(PACKING)
         self.status.set_text("Упаковка…", self._target_name)
         worker.start()
@@ -452,6 +559,7 @@ class MainWindow(QWidget):
             self._set_note("Упаковка отменена")
             return
         target = self._packer.zip_path if self._packer else ""
+        job_id = self._packer.job_id if self._packer else None
         saved = 1.0 - result.ratio
         self._set_note(
             f"Готово · {result.written} "
@@ -482,8 +590,12 @@ class MainWindow(QWidget):
         )
         box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
         box.exec()
-        if box.clickedButton() is reveal:
-            self._reveal(target)
+        with job_context(job_id):
+            if box.clickedButton() is reveal:
+                log.info("User asked to reveal the archive: %s", target)
+                reveal_in_explorer(target)
+            else:
+                log.info("Result dialog closed")
 
     def _on_pack_failed(self, message: str) -> None:
         self._set_note("Ошибка упаковки")
@@ -499,8 +611,10 @@ class MainWindow(QWidget):
 
     def _cancel_current(self) -> None:
         if self._state == SCANNING and self._scanner is not None:
+            log.info("Cancel requested for %s", self._scanner.job_id)
             self._scanner.cancel()
         elif self._state == PACKING and self._packer is not None:
+            log.info("Cancel requested for %s", self._packer.job_id)
             self._packer.cancel()
             self.status.set_text("Отмена…", self._target_name)
 
@@ -515,11 +629,17 @@ class MainWindow(QWidget):
     def dropEvent(self, event) -> None:
         self.empty.set_highlighted(False)
         if self._state == PACKING:
+            log.info("Drop ignored while packing")
             return
-        for url in event.mimeData().urls():
+        urls = event.mimeData().urls()
+        log.info("Dropped %d items", len(urls))
+        for url in urls:
             local = url.toLocalFile()
             if local:
                 self.add_path(local)
+            else:
+                log.warning("Dropped item is not a local file: %s",
+                            url.toString())
         event.acceptProposedAction()
 
     def toggle_max_restore(self) -> None:
@@ -581,35 +701,84 @@ class MainWindow(QWidget):
         super().mousePressEvent(event)
 
     def closeEvent(self, event) -> None:
+        log.info("Window closing: state=%s", _STATE_NAMES[self._state])
         self._closing = True
         self._save_settings()
         self._scan_queue.clear()
         for worker in (self._scanner, self._packer):
             if worker is not None and worker.isRunning():
+                log.info("Stopping %s before exit", worker.job_id)
                 worker.cancel()
-                worker.wait(5000)
+                if worker.wait(5000):
+                    log.info("%s stopped", worker.job_id)
+                else:
+                    log.warning("%s did not stop within 5 s", worker.job_id)
         event.accept()
+
+
+_QT_LEVELS = {
+    QtMsgType.QtDebugMsg: logging.DEBUG,
+    QtMsgType.QtInfoMsg: logging.INFO,
+    QtMsgType.QtWarningMsg: logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg: logging.CRITICAL,
+}
+_qt_log = logging.getLogger("quickzip.qt")
+
+
+def _qt_message_handler(mode, context, message) -> None:
+    where = ""
+    if context is not None and context.file:
+        where = f" ({context.file}:{context.line})"
+    _qt_log.log(_QT_LEVELS.get(mode, logging.WARNING), "%s%s", message, where)
 
 
 def _install_translator(application: QApplication) -> None:
     translator = QTranslator(application)
     path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
-    if translator.load(QLocale.system(), "qtbase", "_", path):
+    locale = QLocale.system()
+    if translator.load(locale, "qtbase", "_", path):
         application.installTranslator(translator)
+        log.info("Qt translation loaded: locale=%s from %s", locale.name(),
+                 path)
+    else:
+        log.info("No Qt translation for locale=%s in %s", locale.name(),
+                 path)
+
+
+def _set_app_user_model_id() -> None:
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "QuickZip.Desktop.App"
+        )
+    except (AttributeError, OSError) as exc:
+        log.warning("Cannot set AppUserModelID (taskbar grouping): %s", exc)
 
 
 def run(argv: list[str] | None = None) -> int:
+    started = time.perf_counter()
     arguments = list(argv if argv is not None else sys.argv)
+    log_path = setup_logging()
+    log.info(
+        "%s %s starting: python=%s qt=%s pyqt=%s os=%s frozen=%s exe=%s",
+        APP_NAME, APP_VERSION, platform.python_version(), qVersion(),
+        PYQT_VERSION_STR, platform.platform(),
+        bool(getattr(sys, "frozen", False)), sys.executable,
+    )
+    log.info(
+        "Logging: file=%s level=%s; pack: level=%d workers=%d; "
+        "expand limit=%d rows",
+        log_path or "<disabled>",
+        logging.getLevelName(logging.getLogger().level),
+        PackOptions().level, default_workers(), EXPAND_ROW_LIMIT,
+    )
+    qInstallMessageHandler(_qt_message_handler)
     if sys.platform == "win32":
-        try:
-            import ctypes
+        _set_app_user_model_id()
 
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "QuickZip.Desktop.App"
-            )
-        except Exception:
-            pass
-
+    log.info("Creating QApplication")
     QApplication.setApplicationName(APP_NAME)
     QApplication.setApplicationVersion(APP_VERSION)
     QApplication.setOrganizationName("QuickZip")
@@ -620,11 +789,24 @@ def run(argv: list[str] | None = None) -> int:
     _install_translator(application)
     icon = app_icon()
     application.setWindowIcon(icon)
+    log.info("QApplication ready in %.0f ms",
+             (time.perf_counter() - started) * 1000)
 
     window = MainWindow()
     window.setWindowIcon(icon)
     window.show()
-    for path in arguments[1:]:
-        if not path.startswith("-"):
-            QTimer.singleShot(0, lambda item=path: window.add_path(item))
-    return application.exec()
+    log.info("Main window shown in %.0f ms since start",
+             (time.perf_counter() - started) * 1000)
+
+    watchdog = StallWatchdog(STALL_THRESHOLD, parent=application)
+    watchdog.start()
+    paths = [path for path in arguments[1:] if not path.startswith("-")]
+    if paths:
+        log.info("Command line paths: %d", len(paths))
+    for path in paths:
+        QTimer.singleShot(0, lambda item=path: window.add_path(item))
+    code = application.exec()
+    watchdog.stop()
+    log.info("Event loop finished with code %d after %.1f s", code,
+             time.perf_counter() - started)
+    return code

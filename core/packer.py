@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -7,6 +8,7 @@ import zlib
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Iterable, Iterator, Sequence
 
 from core.formatting import extension_of
@@ -27,6 +29,11 @@ PROBE_SIZE = 1 << 17
 PROBE_RATIO = 0.94
 
 _DEFLATE_EOS = b"\x01\x00\x00\xff\xff"
+
+_CRC_POLY = 0xEDB88320
+_CRC_ONE = 0x80000000
+
+log = logging.getLogger("quickzip.packer")
 
 
 @dataclass(slots=True)
@@ -74,49 +81,45 @@ def default_workers() -> int:
     return max(2, min(16, os.cpu_count() or 4))
 
 
+def _multmodp(a: int, b: int) -> int:
+    mask = _CRC_ONE
+    product = 0
+    while True:
+        if a & mask:
+            product ^= b
+            if not a & (mask - 1):
+                return product
+        mask >>= 1
+        b = (b >> 1) ^ _CRC_POLY if b & 1 else b >> 1
+
+
+def _x2n_table() -> tuple[int, ...]:
+    table = [1 << 30]
+    for _ in range(31):
+        table.append(_multmodp(table[-1], table[-1]))
+    return tuple(table)
+
+
+_X2N = _x2n_table()
+
+
+@lru_cache(maxsize=64)
+def _shift_operator(length: int) -> int:
+    operator = _CRC_ONE
+    power = 3
+    while length:
+        if length & 1:
+            operator = _multmodp(_X2N[power & 31], operator)
+        length >>= 1
+        power += 1
+    return operator
+
+
 def crc32_combine(crc1: int, crc2: int, len2: int) -> int:
     if len2 <= 0:
         return crc1 & 0xFFFFFFFF
-    even = [0] * 32
-    odd = [0] * 32
-    odd[0] = 0xEDB88320
-    row = 1
-    for index in range(1, 32):
-        odd[index] = row
-        row <<= 1
-    _square(even, odd)
-    _square(odd, even)
-    crc1 &= 0xFFFFFFFF
-    while True:
-        _square(even, odd)
-        if len2 & 1:
-            crc1 = _apply(even, crc1)
-        len2 >>= 1
-        if len2 == 0:
-            break
-        _square(odd, even)
-        if len2 & 1:
-            crc1 = _apply(odd, crc1)
-        len2 >>= 1
-        if len2 == 0:
-            break
-    return (crc1 ^ (crc2 & 0xFFFFFFFF)) & 0xFFFFFFFF
-
-
-def _apply(matrix: list[int], vector: int) -> int:
-    total = 0
-    index = 0
-    while vector:
-        if vector & 1:
-            total ^= matrix[index]
-        vector >>= 1
-        index += 1
-    return total & 0xFFFFFFFF
-
-
-def _square(target: list[int], source: list[int]) -> None:
-    for index in range(32):
-        target[index] = _apply(source, source[index])
+    combined = _multmodp(_shift_operator(len2), crc1 & 0xFFFFFFFF)
+    return (combined ^ (crc2 & 0xFFFFFFFF)) & 0xFFFFFFFF
 
 
 def _deflate(data: bytes, level: int) -> bytes:
@@ -205,11 +208,16 @@ def _probe_compressible(path: str, level: int) -> bool:
     try:
         with open(long_path(path), "rb", buffering=0) as handle:
             head = handle.read(PROBE_SIZE)
-    except OSError:
+    except OSError as exc:
+        log.warning("Cannot probe %s, will try to compress: %s", path, exc)
         return True
     if len(head) < 4096:
         return True
-    return len(_deflate(head, min(level, 1))) < len(head) * PROBE_RATIO
+    compressible = (
+        len(_deflate(head, min(level, 1))) < len(head) * PROBE_RATIO
+    )
+    log.debug("Probe %s: compressible=%s", path, compressible)
+    return compressible
 
 
 def _unique_arcname(arcname: str, used: set[str]) -> str:
@@ -269,6 +277,11 @@ def _iter_units(
         if not store and options.smart_store:
             store = not _probe_compressible(item.src, options.level)
         method = STORED if store else DEFLATED
+        log.debug(
+            "Streaming large file %s: %d bytes in %d chunks, method=%s",
+            item.src, item.size, -(-item.size // options.chunk_size),
+            "stored" if store else "deflated",
+        )
         offset = 0
         while offset < item.size:
             length = min(options.chunk_size, item.size - offset)
@@ -316,6 +329,7 @@ def create_zip(
     opts = options or PackOptions()
     ordered = list(items)
     total_bytes = sum(item.size for item in ordered if not item.is_dir)
+    dirs = sum(1 for item in ordered if item.is_dir)
     result = PackResult(total_size=total_bytes)
     reporter = _Reporter(progress, max(total_bytes, 1), opts.progress_interval)
     started = time.monotonic()
@@ -327,6 +341,12 @@ def create_zip(
     def cancelled() -> bool:
         return stop.is_set() or bool(should_cancel and should_cancel())
 
+    log.info(
+        "Packing %d items (%d files, %d dirs, %d bytes) -> %s; level=%d "
+        "workers=%d smart_store=%s",
+        len(ordered), len(ordered) - dirs, dirs, total_bytes, zip_path,
+        opts.level, workers, opts.smart_store,
+    )
     completed = False
     handle = open(long_path(zip_path), "wb", buffering=opts.write_buffer)
     try:
@@ -400,6 +420,19 @@ def create_zip(
         if not completed:
             _remove_quietly(zip_path)
     result.elapsed = time.monotonic() - started
+    if result.cancelled:
+        log.info(
+            "Packing cancelled after %.1f s: written=%d skipped=%d",
+            result.elapsed, result.written, result.skipped,
+        )
+    else:
+        log.info(
+            "Archive written: %s; entries=%d skipped=%d %d -> %d bytes "
+            "(%.0f%%) in %.1f s (%.1f MB/s)",
+            zip_path, result.written, result.skipped, total_bytes,
+            result.archive_size, result.ratio * 100, result.elapsed,
+            total_bytes / max(result.elapsed, 0.001) / (1 << 20),
+        )
     if progress and not result.cancelled:
         progress(max(total_bytes, 1), max(total_bytes, 1), "")
     return result
@@ -421,13 +454,20 @@ def _write_blobs(
     result: PackResult,
     reporter: _Reporter,
 ) -> None:
+    debug = log.isEnabledFor(logging.DEBUG)
     for blob in blobs:
         name = os.path.basename(blob.item.src)
         if blob.error:
             result.skipped += 1
             result.warnings.append(f"{name}: {blob.error}")
+            log.warning("Skipped unreadable file %s: %s", blob.item.src,
+                        blob.error)
             reporter.advance(blob.item.size, name)
             continue
+        if debug:
+            log.debug("Added %s: %d -> %d bytes (%s)", blob.item.arcname,
+                      blob.size, len(blob.payload),
+                      "deflated" if blob.method == DEFLATED else "stored")
         writer.add_blob(
             _unique_arcname(blob.item.arcname, used),
             blob.payload,
@@ -459,6 +499,10 @@ def _write_chunk(
     if part.error and not state.broken:
         state.broken = True
         result.warnings.append(f"{name}: {part.error}")
+        log.warning(
+            "Read failed for %s at offset %d: %s; entry truncated",
+            chunk.item.src, chunk.offset, part.error,
+        )
 
     if not state.broken:
         if state.opened:
@@ -492,5 +536,9 @@ def _write_chunk(
 def _remove_quietly(path: str) -> None:
     try:
         os.remove(path)
-    except OSError:
-        pass
+    except FileNotFoundError:
+        log.debug("Incomplete archive already gone: %s", path)
+    except OSError as exc:
+        log.warning("Cannot remove incomplete archive %s: %s", path, exc)
+    else:
+        log.info("Removed incomplete archive %s", path)
